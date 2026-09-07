@@ -1,9 +1,13 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Model;
 
 /**
  * Class User
+ *
+ * Security focus: CONFIDENTIALITY
  *
  * @property int $id
  * @property ?string $username
@@ -33,11 +37,31 @@ class User extends \Model
     public const RANK_ADMIN = 4;
     public const RANK_SUPER = 5;
 
+    private const PASSWORD_MIN_LENGTH = 12;
+    private const PASSWORD_MAX_LENGTH = 1024;
+
+    private const BCRYPT_COST = 12;
+
+    /*
+     * OWASP minimum Argon2id baseline:
+     * 19 MiB memory, 2 iterations, parallelism 1.
+     */
+    private const ARGON_MEMORY_COST = 19456;
+    private const ARGON_TIME_COST = 2;
+    private const ARGON_THREADS = 1;
+
+    private const RESET_TOKEN_RANDOM_BYTES = 32;
     private const RESET_TOKEN_HASH_ALGORITHM = 'sha384';
     private const RESET_TOKEN_HASH_LENGTH = 96;
-    private const RESET_RANDOM_BYTES = 64;
 
-    private const MIN_AVATAR_SIZE = 1;
+    private const LOGIN_MAX_ATTEMPTS = 5;
+    private const LOGIN_WINDOW_SECONDS = 900;
+
+    private const RESET_MAX_ATTEMPTS = 5;
+    private const RESET_WINDOW_SECONDS = 900;
+
+    private const MAX_IDENTIFIER_LENGTH = 254;
+
     private const MAX_AVATAR_SIZE = 2048;
 
     protected $_table_name = 'user';
@@ -46,6 +70,9 @@ class User extends \Model
 
     /**
      * Load currently authenticated user.
+     *
+     * Sensitive information is deliberately excluded from
+     * the globally accessible F3 user context.
      */
     public function loadCurrent(): static
     {
@@ -54,17 +81,11 @@ class User extends \Model
         $session = new Session();
         $session->loadCurrent();
 
-        $userId = filter_var(
-            $session->user_id ?? null,
-            FILTER_VALIDATE_INT,
-            [
-                'options' => [
-                    'min_range' => 1,
-                ],
-            ]
+        $userId = $this->validatePositiveId(
+            $session->user_id ?? null
         );
 
-        if ($userId === false) {
+        if ($userId === null) {
             return $this;
         }
 
@@ -77,17 +98,294 @@ class User extends \Model
             return $this;
         }
 
-        $f3->set('user', $this->cast());
+        /*
+         * CONFIDENTIALITY:
+         *
+         * Do NOT expose:
+         * - password
+         * - salt
+         * - reset_token
+         * - api_key
+         *
+         * through the globally available hive.
+         */
+        $f3->set(
+            'user',
+            $this->getPublicSessionData()
+        );
+
+        /*
+         * Keep the object for compatibility with the project,
+         * but sensitive information must never be serialized
+         * or rendered from this object.
+         */
         $f3->set('user_obj', $this);
 
         if ($this->exists('language') && $this->language) {
             $f3->set(
                 'LANGUAGE',
-                $this->sanitizeLanguage((string) $this->language)
+                $this->sanitizeLanguage(
+                    (string) $this->language
+                )
             );
         }
 
         return $this;
+    }
+
+    /**
+     * Return only information that is safe to place
+     * in the application-wide authenticated-user context.
+     */
+    public function getPublicSessionData(): array
+    {
+        return [
+            'id' => (int) $this->id,
+            'username' => $this->username,
+            'email' => $this->email,
+            'name' => $this->name,
+            'role' => $this->role,
+            'rank' => (int) $this->rank,
+            'task_color' => $this->task_color,
+            'theme' => $this->theme,
+            'language' => $this->language,
+            'avatar_filename' => $this->avatar_filename,
+            'api_visible' => (int) $this->api_visible,
+            'created_date' => $this->created_date,
+        ];
+    }
+
+    /**
+     * Securely hash and store a password.
+     *
+     * Argon2id is preferred. Bcrypt is used only as fallback.
+     */
+    public function setPassword(string $plainPassword): static
+    {
+        $this->validatePassword($plainPassword);
+
+        $algorithm = $this->getPasswordAlgorithm();
+        $options = $this->getPasswordOptions($algorithm);
+
+        $hash = password_hash(
+            $plainPassword,
+            $algorithm,
+            $options
+        );
+
+        if ($hash === false) {
+            throw new \RuntimeException(
+                'Unable to securely hash password.'
+            );
+        }
+
+        $this->password = $hash;
+
+        /*
+         * password_hash() generates and stores its own salt.
+         * A separate application-managed salt is unnecessary
+         * and should not be reused.
+         */
+        $this->salt = null;
+
+        return $this;
+    }
+
+    /**
+     * Verify a plaintext password using PHP's timing-safe
+     * password verification implementation.
+     */
+    public function verifyPassword(string $plainPassword): bool
+    {
+        if (!$this->isValidPasswordInput($plainPassword)) {
+            /*
+             * Run a dummy password operation to reduce observable
+             * timing differences for malformed requests.
+             */
+            $this->dummyPasswordVerification();
+
+            return false;
+        }
+
+        $storedHash = (string) ($this->password ?? '');
+
+        if ($storedHash === '') {
+            $this->dummyPasswordVerification();
+
+            return false;
+        }
+
+        return password_verify(
+            $plainPassword,
+            $storedHash
+        );
+    }
+
+    /**
+     * Upgrade password hashes automatically when the current
+     * algorithm or parameters become outdated.
+     */
+    public function rehashPasswordIfNecessary(
+        string $plainPassword
+    ): bool {
+        if (!$this->verifyPassword($plainPassword)) {
+            return false;
+        }
+
+        $algorithm = $this->getPasswordAlgorithm();
+        $options = $this->getPasswordOptions($algorithm);
+
+        if (
+            password_needs_rehash(
+                (string) $this->password,
+                $algorithm,
+                $options
+            )
+        ) {
+            $this->setPassword($plainPassword);
+            $this->save();
+        }
+
+        return true;
+    }
+
+    /**
+     * Secure authentication entry point.
+     *
+     * Implements:
+     * - generic authentication result;
+     * - account enumeration resistance;
+     * - brute-force protection;
+     * - password verification;
+     * - password hash migration;
+     * - deleted account protection.
+     *
+     * $clientKey should ideally contain a trusted representation
+     * of the remote client (for example the validated remote IP).
+     */
+    public function authenticateSecure(
+        string $identifier,
+        string $password,
+        string $clientKey = ''
+    ): bool {
+        $identifier = $this->normalizeIdentifier($identifier);
+        $clientKey = $this->normalizeClientKey($clientKey);
+
+        if (
+            $identifier === ''
+            || !$this->isValidPasswordInput($password)
+        ) {
+            $this->dummyPasswordVerification();
+
+            return false;
+        }
+
+        $rateLimitKey = $this->buildLoginRateLimitKey(
+            $identifier,
+            $clientKey
+        );
+
+        if ($this->isRateLimited($rateLimitKey)) {
+            /*
+             * Perform dummy work to avoid making lockout state
+             * trivially distinguishable through timing.
+             */
+            $this->dummyPasswordVerification();
+
+            return false;
+        }
+
+        $this->load([
+            '(username = ? OR email = ?) AND deleted_date IS NULL',
+            $identifier,
+            $identifier,
+        ]);
+
+        if (!$this->id) {
+            $this->dummyPasswordVerification();
+            $this->recordFailedAttempt($rateLimitKey);
+
+            return false;
+        }
+
+        if (!$this->verifyPassword($password)) {
+            $this->recordFailedAttempt($rateLimitKey);
+
+            return false;
+        }
+
+        /*
+         * Authentication succeeded.
+         */
+        $this->clearFailedAttempts($rateLimitKey);
+
+        /*
+         * Seamlessly migrate Bcrypt/old Argon parameters
+         * to the currently preferred configuration.
+         */
+        $this->rehashPasswordIfNecessary($password);
+
+        return true;
+    }
+
+    /**
+     * Verify an API key without using equality operators
+     * on secret values.
+     */
+    public function verifyApiKey(string $providedApiKey): bool
+    {
+        $storedApiKey = (string) ($this->api_key ?? '');
+
+        if (
+            $providedApiKey === ''
+            || $storedApiKey === ''
+            || strlen($providedApiKey) > 512
+        ) {
+            return false;
+        }
+
+        /*
+         * Compare hashes of fixed size to avoid leaking
+         * information about secret length.
+         */
+        $expected = hash(
+            'sha256',
+            $storedApiKey
+        );
+
+        $provided = hash(
+            'sha256',
+            $providedApiKey
+        );
+
+        return hash_equals(
+            $expected,
+            $provided
+        );
+    }
+
+    /**
+     * Generate a cryptographically secure API key.
+     *
+     * The caller is responsible for displaying the returned
+     * plaintext key only once.
+     */
+    public function generateApiKey(): string
+    {
+        $apiKey = bin2hex(
+            random_bytes(32)
+        );
+
+        /*
+         * Existing database schema stores api_key directly.
+         *
+         * Ideally the schema should store a SHA-256/HMAC hash
+         * instead of the plaintext key. This assignment preserves
+         * compatibility with the existing schema.
+         */
+        $this->api_key = $apiKey;
+
+        return $apiKey;
     }
 
     /**
@@ -102,7 +400,7 @@ class User extends \Model
         }
 
         $size = max(
-            self::MIN_AVATAR_SIZE,
+            1,
             min(self::MAX_AVATAR_SIZE, $size)
         );
 
@@ -111,15 +409,17 @@ class User extends \Model
         );
 
         if ($avatarFilename !== '') {
-            $avatarPath = sprintf(
-                'uploads/avatars/%s',
-                $avatarFilename
-            );
+            $avatarPath =
+                'uploads/avatars/' .
+                $avatarFilename;
 
             if (is_file($avatarPath)) {
                 return sprintf(
                     '%s/avatar/%d-%d.png',
-                    rtrim((string) \Base::instance()->get('BASE'), '/'),
+                    rtrim(
+                        (string) \Base::instance()->get('BASE'),
+                        '/'
+                    ),
                     $size,
                     (int) $this->id
                 );
@@ -138,7 +438,7 @@ class User extends \Model
     }
 
     /**
-     * Load all active users.
+     * Load active users.
      */
     public function getAll(): array
     {
@@ -151,10 +451,15 @@ class User extends \Model
     }
 
     /**
-     * Load all deleted users.
+     * Deleted-user information is more sensitive than the
+     * normal user directory and requires administrative access.
      */
     public function getAllDeleted(): array
     {
+        $this->requireMinimumRank(
+            self::RANK_ADMIN
+        );
+
         return $this->find(
             "deleted_date IS NOT NULL AND role != 'group'",
             [
@@ -164,7 +469,7 @@ class User extends \Model
     }
 
     /**
-     * Load all active groups.
+     * Load active groups.
      */
     public function getAllGroups(): array
     {
@@ -177,7 +482,7 @@ class User extends \Model
     }
 
     /**
-     * Get all users within a group.
+     * Get users within a group.
      *
      * @return array|null
      */
@@ -191,7 +496,9 @@ class User extends \Model
             return $this->_groupUsers;
         }
 
-        $groupId = $this->validatePositiveId($this->id);
+        $groupId = $this->validatePositiveId(
+            $this->id
+        );
 
         if ($groupId === null) {
             return $this->_groupUsers = [];
@@ -199,16 +506,16 @@ class User extends \Model
 
         $groupModel = new User\Group();
 
-        $groupUsers = $groupModel->find([
+        $memberships = $groupModel->find([
             'group_id = ?',
             $groupId,
         ]) ?: [];
 
         $userIds = [];
 
-        foreach ($groupUsers as $groupUser) {
+        foreach ($memberships as $membership) {
             $userId = $this->validatePositiveId(
-                $groupUser->user_id ?? null
+                $membership->user_id ?? null
             );
 
             if ($userId !== null) {
@@ -216,7 +523,9 @@ class User extends \Model
             }
         }
 
-        $userIds = array_values(array_unique($userIds));
+        $userIds = array_values(
+            array_unique($userIds)
+        );
 
         if ($userIds === []) {
             return $this->_groupUsers = [];
@@ -224,19 +533,25 @@ class User extends \Model
 
         $placeholders = implode(
             ',',
-            array_fill(0, count($userIds), '?')
+            array_fill(
+                0,
+                count($userIds),
+                '?'
+            )
         );
 
-        $result = $this->find([
-            "id IN ({$placeholders}) AND deleted_date IS NULL",
+        $users = $this->find([
+            "id IN ({$placeholders})
+             AND deleted_date IS NULL",
             ...$userIds,
         ]);
 
-        return $this->_groupUsers = $result ?: [];
+        return $this->_groupUsers =
+            $users ?: [];
     }
 
     /**
-     * Get IDs of users within a group.
+     * Get user IDs within a group.
      *
      * @return array|null
      */
@@ -251,24 +566,29 @@ class User extends \Model
         $ids = [];
 
         foreach ($users as $user) {
-            $userId = $this->validatePositiveId(
+            $id = $this->validatePositiveId(
                 $user->id ?? null
             );
 
-            if ($userId !== null) {
-                $ids[] = $userId;
+            if ($id !== null) {
+                $ids[] = $id;
             }
         }
 
-        return array_values(array_unique($ids));
+        return array_values(
+            array_unique($ids)
+        );
     }
 
     /**
-     * Get all user and group IDs shared with the current user.
+     * Get IDs of users sharing groups with this user.
      */
     public function getSharedGroupUserIds(): array
     {
-        $currentUserId = $this->validatePositiveId($this->id);
+        $currentUserId =
+            $this->validatePositiveId(
+                $this->id
+            );
 
         if ($currentUserId === null) {
             return [];
@@ -284,16 +604,19 @@ class User extends \Model
         $groupIds = [];
 
         foreach ($groups as $group) {
-            $groupId = $this->validatePositiveId(
-                $group->group_id ?? null
-            );
+            $groupId =
+                $this->validatePositiveId(
+                    $group->group_id ?? null
+                );
 
             if ($groupId !== null) {
                 $groupIds[] = $groupId;
             }
         }
 
-        $groupIds = array_values(array_unique($groupIds));
+        $groupIds = array_values(
+            array_unique($groupIds)
+        );
 
         if ($groupIds === []) {
             return [$currentUserId];
@@ -301,28 +624,36 @@ class User extends \Model
 
         $placeholders = implode(
             ',',
-            array_fill(0, count($groupIds), '?')
+            array_fill(
+                0,
+                count($groupIds),
+                '?'
+            )
         );
 
-        $memberships = $groupModel->find([
-            "group_id IN ({$placeholders})",
-            ...$groupIds,
-        ]) ?: [];
+        $memberships =
+            $groupModel->find([
+                "group_id IN ({$placeholders})",
+                ...$groupIds,
+            ]) ?: [];
 
         $ids = $groupIds;
         $ids[] = $currentUserId;
 
         foreach ($memberships as $membership) {
-            $userId = $this->validatePositiveId(
-                $membership->user_id ?? null
-            );
+            $userId =
+                $this->validatePositiveId(
+                    $membership->user_id ?? null
+                );
 
             if ($userId !== null) {
                 $ids[] = $userId;
             }
         }
 
-        return array_values(array_unique($ids));
+        return array_values(
+            array_unique($ids)
+        );
     }
 
     /**
@@ -354,20 +685,34 @@ class User extends \Model
     }
 
     /**
-     * Get or set a user option.
+     * Get or set an option.
      *
      * @param mixed $value
      *
      * @return mixed
      */
-    public function option(string $key, $value = null)
-    {
-        $key = $this->sanitizeOptionKey($key);
+    public function option(
+        string $key,
+        $value = null
+    ) {
+        $key = $this->sanitizeOptionKey(
+            $key
+        );
 
         if ($key === '') {
             return $value === null
                 ? null
                 : $this;
+        }
+
+        /*
+         * Prevent secrets from accidentally being copied
+         * into the generic options JSON field.
+         */
+        if ($this->isSensitiveOptionKey($key)) {
+            throw new \InvalidArgumentException(
+                'Sensitive values cannot be stored as user options.'
+            );
         }
 
         $options = $this->options();
@@ -376,12 +721,16 @@ class User extends \Model
             return $options[$key] ?? null;
         }
 
-        $options[$key] = $this->sanitizeOptionValue($value);
+        $options[$key] =
+            $this->sanitizeOptionValue(
+                $value
+            );
 
         try {
             $this->options = json_encode(
                 $options,
                 JSON_THROW_ON_ERROR
+                | JSON_UNESCAPED_UNICODE
             );
         } catch (\JsonException $exception) {
             throw new \InvalidArgumentException(
@@ -395,11 +744,14 @@ class User extends \Model
     }
 
     /**
-     * Send an email alert with issues due on the given date.
+     * Send due issue alert.
      */
-    public function sendDueAlert(string $date = ''): bool
-    {
-        $userId = $this->validatePositiveId($this->id);
+    public function sendDueAlert(
+        string $date = ''
+    ): bool {
+        $userId = $this->validatePositiveId(
+            $this->id
+        );
 
         if ($userId === null) {
             return false;
@@ -408,7 +760,8 @@ class User extends \Model
         if ($date === '' || $date === '0') {
             $date = date(
                 'Y-m-d',
-                \Helper\View::instance()->utc2local()
+                \Helper\View::instance()
+                    ->utc2local()
             );
         }
 
@@ -426,24 +779,27 @@ class User extends \Model
         ]) ?: [];
 
         foreach ($groups as $group) {
-            $groupId = $this->validatePositiveId(
-                $group->group_id ?? null
-            );
+            $groupId =
+                $this->validatePositiveId(
+                    $group->group_id ?? null
+                );
 
             if ($groupId !== null) {
                 $ownerIds[] = $groupId;
             }
         }
 
-        $ownerIds = array_values(array_unique($ownerIds));
-
-        if ($ownerIds === []) {
-            return false;
-        }
+        $ownerIds = array_values(
+            array_unique($ownerIds)
+        );
 
         $placeholders = implode(
             ',',
-            array_fill(0, count($ownerIds), '?')
+            array_fill(
+                0,
+                count($ownerIds),
+                '?'
+            )
         );
 
         $parameters = array_merge(
@@ -451,14 +807,14 @@ class User extends \Model
             $ownerIds
         );
 
-        $issueModel = new Issue();
+        $issue = new Issue();
 
-        $due = $issueModel->find(
+        $due = $issue->find(
             [
                 "due_date = ?
-                AND owner_id IN ({$placeholders})
-                AND closed_date IS NULL
-                AND deleted_date IS NULL",
+                 AND owner_id IN ({$placeholders})
+                 AND closed_date IS NULL
+                 AND deleted_date IS NULL",
                 ...$parameters,
             ],
             [
@@ -466,12 +822,12 @@ class User extends \Model
             ]
         ) ?: [];
 
-        $overdue = $issueModel->find(
+        $overdue = $issue->find(
             [
                 "due_date < ?
-                AND owner_id IN ({$placeholders})
-                AND closed_date IS NULL
-                AND deleted_date IS NULL",
+                 AND owner_id IN ({$placeholders})
+                 AND closed_date IS NULL
+                 AND deleted_date IS NULL",
                 ...$parameters,
             ],
             [
@@ -479,38 +835,42 @@ class User extends \Model
             ]
         ) ?: [];
 
-        if ($due === [] && $overdue === []) {
+        if (
+            $due === []
+            && $overdue === []
+        ) {
             return false;
         }
 
-        $notification = new \Helper\Notification();
+        $notification =
+            new \Helper\Notification();
 
-        return (bool) $notification->user_due_issues(
-            $this,
-            $due,
-            $overdue
-        );
+        return (bool)
+            $notification->user_due_issues(
+                $this,
+                $due,
+                $overdue
+            );
     }
 
     /**
      * Get user statistics.
-     *
-     * @param int $time Lower timestamp limit.
      */
-    public function stats(int $time = 0): array
-    {
-        $userId = $this->validatePositiveId($this->id);
+    public function stats(
+        int $time = 0
+    ): array {
+        $userId =
+            $this->validatePositiveId(
+                $this->id
+            );
 
         if ($userId === null) {
-            return [
-                'labels' => [],
-                'spent' => [],
-                'closed' => [],
-                'created' => [],
-            ];
+            return $this->emptyStats();
         }
 
-        $offset = (int) \Helper\View::instance()->timeoffset();
+        $offset =
+            (int) \Helper\View::instance()
+                ->timeoffset();
 
         if ($time <= 0) {
             $time = strtotime(
@@ -519,7 +879,8 @@ class User extends \Model
             );
 
             if ($time === false) {
-                $time = time() - 1209600;
+                $time =
+                    time() - (14 * 86400);
             }
         }
 
@@ -528,118 +889,136 @@ class User extends \Model
             ', INTERVAL :offset SECOND))',
         ];
 
-        if (\Base::instance()->get('db.engine') === 'sqlite') {
+        if (
+            \Base::instance()
+                ->get('db.engine') === 'sqlite'
+        ) {
             $dateExpression = [
                 'DATE(',
                 ", :offset || ' seconds')",
             ];
         }
 
-        $date = date('Y-m-d H:i:s', $time);
+        $fromDate =
+            date('Y-m-d H:i:s', $time);
 
         $parameters = [
             ':user' => $userId,
             ':offset' => $offset,
-            ':date' => $date,
+            ':date' => $fromDate,
         ];
 
         $spent = $this->db->exec(
             "SELECT
-                {$dateExpression[0]}u.created_date{$dateExpression[1]} AS `date`,
+                {$dateExpression[0]}
+                u.created_date
+                {$dateExpression[1]} AS `date`,
                 SUM(f.new_value - f.old_value) AS `val`
-            FROM issue_update u
-            JOIN issue_update_field f
-                ON u.id = f.issue_update_id
-                AND f.field = 'hours_spent'
-            WHERE
-                u.user_id = :user
-                AND u.created_date > :date
-            GROUP BY `date`",
+             FROM issue_update u
+             JOIN issue_update_field f
+               ON u.id = f.issue_update_id
+              AND f.field = 'hours_spent'
+             WHERE u.user_id = :user
+               AND u.created_date > :date
+             GROUP BY `date`",
             $parameters
         ) ?: [];
 
         $closed = $this->db->exec(
             "SELECT
-                {$dateExpression[0]}i.closed_date{$dateExpression[1]} AS `date`,
+                {$dateExpression[0]}
+                i.closed_date
+                {$dateExpression[1]} AS `date`,
                 COUNT(*) AS `val`
-            FROM issue i
-            WHERE
-                i.owner_id = :user
-                AND i.closed_date > :date
-            GROUP BY `date`",
+             FROM issue i
+             WHERE i.owner_id = :user
+               AND i.closed_date > :date
+             GROUP BY `date`",
             $parameters
         ) ?: [];
 
         $created = $this->db->exec(
             "SELECT
-                {$dateExpression[0]}i.created_date{$dateExpression[1]} AS `date`,
+                {$dateExpression[0]}
+                i.created_date
+                {$dateExpression[1]} AS `date`,
                 COUNT(*) AS `val`
-            FROM issue i
-            WHERE
-                i.author_id = :user
-                AND i.created_date > :date
-            GROUP BY `date`",
+             FROM issue i
+             WHERE i.author_id = :user
+               AND i.created_date > :date
+             GROUP BY `date`",
             $parameters
         ) ?: [];
 
-        $dates = $this->_createDateRangeArray(
-            date('Y-m-d', $time),
-            date('Y-m-d', time() + $offset)
-        );
+        $dates =
+            $this->_createDateRangeArray(
+                date('Y-m-d', $time),
+                date(
+                    'Y-m-d',
+                    time() + $offset
+                )
+            );
 
-        $result = [
-            'labels' => [],
-            'spent' => [],
-            'closed' => [],
-            'created' => [],
-        ];
+        $result = $this->emptyStats();
 
         foreach ($spent as $row) {
-            if (!isset($row['date'], $row['val'])) {
-                continue;
+            if (
+                isset(
+                    $row['date'],
+                    $row['val']
+                )
+            ) {
+                $result['spent'][
+                    (string) $row['date']
+                ] = (float) $row['val'];
             }
-
-            $result['spent'][(string) $row['date']] =
-                (float) $row['val'];
         }
 
         foreach ($closed as $row) {
-            if (!isset($row['date'], $row['val'])) {
-                continue;
+            if (
+                isset(
+                    $row['date'],
+                    $row['val']
+                )
+            ) {
+                $result['closed'][
+                    (string) $row['date']
+                ] = (int) $row['val'];
             }
-
-            $result['closed'][(string) $row['date']] =
-                (int) $row['val'];
         }
 
         foreach ($created as $row) {
-            if (!isset($row['date'], $row['val'])) {
-                continue;
+            if (
+                isset(
+                    $row['date'],
+                    $row['val']
+                )
+            ) {
+                $result['created'][
+                    (string) $row['date']
+                ] = (int) $row['val'];
             }
-
-            $result['created'][(string) $row['date']] =
-                (int) $row['val'];
         }
 
-        foreach ($dates as $dateValue) {
-            $dateValue = (string) $dateValue;
+        foreach ($dates as $date) {
+            $date = (string) $date;
 
-            if (!$this->isValidDate($dateValue)) {
+            if (!$this->isValidDate($date)) {
                 continue;
             }
 
-            $timestamp = strtotime($dateValue);
+            $timestamp = strtotime($date);
 
             if ($timestamp === false) {
                 continue;
             }
 
-            $result['labels'][$dateValue] =
+            $result['labels'][$date] =
                 date('D j', $timestamp);
 
-            $result['spent'][$dateValue] ??= 0.0;
-            $result['closed'][$dateValue] ??= 0;
-            $result['created'][$dateValue] ??= 0;
+            $result['spent'][$date] ??= 0.0;
+            $result['closed'][$date] ??= 0;
+            $result['created'][$date] ??= 0;
         }
 
         foreach ($result as &$values) {
@@ -654,12 +1033,19 @@ class User extends \Model
     /**
      * Reassign open issues.
      *
-     * @throws \RuntimeException
-     * @throws \InvalidArgumentException
+     * Administrative/manager operation.
      */
-    public function reassignIssues(?int $userId): int
-    {
-        $currentUserId = $this->validatePositiveId($this->id);
+    public function reassignIssues(
+        ?int $userId
+    ): int {
+        $this->requireMinimumRank(
+            self::RANK_MANAGER
+        );
+
+        $currentUserId =
+            $this->validatePositiveId(
+                $this->id
+            );
 
         if ($currentUserId === null) {
             throw new \RuntimeException(
@@ -669,7 +1055,9 @@ class User extends \Model
 
         if (
             $userId !== null
-            && $this->validatePositiveId($userId) === null
+            && $this->validatePositiveId(
+                $userId
+            ) === null
         ) {
             throw new \InvalidArgumentException(
                 'Invalid target user identifier.'
@@ -680,8 +1068,8 @@ class User extends \Model
 
         $issues = $issueModel->find([
             'owner_id = ?
-            AND deleted_date IS NULL
-            AND closed_date IS NULL',
+             AND deleted_date IS NULL
+             AND closed_date IS NULL',
             $currentUserId,
         ]) ?: [];
 
@@ -694,16 +1082,19 @@ class User extends \Model
     }
 
     /**
-     * Get date picker language.
+     * Date picker configuration.
      */
     public function date_picker(): object
     {
-        $language = $this->language
-            ?: \Base::instance()->get('LANGUAGE');
+        $language =
+            $this->language
+            ?: \Base::instance()
+                ->get('LANGUAGE');
 
-        $language = $this->sanitizeLanguage(
-            (string) $language
-        );
+        $language =
+            $this->sanitizeLanguage(
+                (string) $language
+            );
 
         return (object) [
             'language' => $language,
@@ -712,16 +1103,24 @@ class User extends \Model
     }
 
     /**
-     * Generate a cryptographically secure password reset token.
+     * Generate a password-reset token.
+     *
+     * Only the SHA-384 hash is stored in the database.
      */
     public function generateResetToken(): string
     {
-        $random = random_bytes(self::RESET_RANDOM_BYTES);
+        $random = bin2hex(
+            random_bytes(
+                self::RESET_TOKEN_RANDOM_BYTES
+            )
+        );
 
-        $token = hash(
-            self::RESET_TOKEN_HASH_ALGORITHM,
-            $random
-        ) . (string) time();
+        $timestamp = (string) time();
+
+        $token =
+            $random .
+            '.' .
+            $timestamp;
 
         $this->reset_token = hash(
             self::RESET_TOKEN_HASH_ALGORITHM,
@@ -732,35 +1131,84 @@ class User extends \Model
     }
 
     /**
-     * Validate a plaintext password reset token.
+     * Validate password-reset token.
+     *
+     * Includes:
+     * - strict input format;
+     * - expiration;
+     * - future timestamp rejection;
+     * - timing-safe secret comparison;
+     * - brute-force throttling.
      */
-    public function validateResetToken(string $token): bool
-    {
+    public function validateResetToken(
+        string $token
+    ): bool {
         $token = trim($token);
 
-        if (
-            $token === ''
-            || strlen($token) <= self::RESET_TOKEN_HASH_LENGTH
-            || empty($this->reset_token)
-        ) {
+        $userId =
+            $this->validatePositiveId(
+                $this->id
+            );
+
+        $rateLimitKey =
+            $this->buildResetRateLimitKey(
+                $userId ?? 0
+            );
+
+        if ($this->isRateLimited(
+            $rateLimitKey,
+            self::RESET_MAX_ATTEMPTS
+        )) {
             return false;
         }
 
-        /*
-         * Tokens generated by generateResetToken() contain:
-         * 96 hexadecimal SHA-384 characters + Unix timestamp.
-         */
+        if (
+            $token === ''
+            || strlen($token) > 256
+            || empty($this->reset_token)
+        ) {
+            $this->recordFailedAttempt(
+                $rateLimitKey,
+                self::RESET_WINDOW_SECONDS
+            );
+
+            return false;
+        }
+
         if (
             !preg_match(
-                '/^[a-f0-9]{96}[0-9]+$/D',
+                '/^[a-f0-9]{64}\.[0-9]{1,12}$/D',
                 $token
             )
         ) {
+            $this->recordFailedAttempt(
+                $rateLimitKey,
+                self::RESET_WINDOW_SECONDS
+            );
+
+            return false;
+        }
+
+        [$randomPart, $timestampPart] =
+            explode('.', $token, 2);
+
+        if (
+            strlen($randomPart) !== 64
+            || !ctype_xdigit($randomPart)
+            || !ctype_digit($timestampPart)
+        ) {
+            $this->recordFailedAttempt(
+                $rateLimitKey,
+                self::RESET_WINDOW_SECONDS
+            );
+
             return false;
         }
 
         $ttl = filter_var(
-            \Base::instance()->get('security.reset_ttl'),
+            \Base::instance()->get(
+                'security.reset_ttl'
+            ),
             FILTER_VALIDATE_INT,
             [
                 'options' => [
@@ -773,33 +1221,32 @@ class User extends \Model
             return false;
         }
 
-        $timestampPart = substr(
-            $token,
-            self::RESET_TOKEN_HASH_LENGTH
-        );
+        $timestamp =
+            (int) $timestampPart;
 
-        if (
-            $timestampPart === ''
-            || !ctype_digit($timestampPart)
-        ) {
-            return false;
-        }
-
-        $timestamp = (int) $timestampPart;
         $currentTime = time();
 
         if (
             $timestamp > $currentTime
-            || $timestamp < ($currentTime - $ttl)
+            || $timestamp <
+                ($currentTime - $ttl)
         ) {
+            $this->recordFailedAttempt(
+                $rateLimitKey,
+                self::RESET_WINDOW_SECONDS
+            );
+
             return false;
         }
 
-        $expectedHash = (string) $this->reset_token;
+        $storedHash =
+            (string) $this->reset_token;
 
         if (
-            strlen($expectedHash) !== self::RESET_TOKEN_HASH_LENGTH
-            || !ctype_xdigit($expectedHash)
+            strlen($storedHash)
+                !==
+                self::RESET_TOKEN_HASH_LENGTH
+            || !ctype_xdigit($storedHash)
         ) {
             return false;
         }
@@ -809,17 +1256,372 @@ class User extends \Model
             $token
         );
 
-        return hash_equals(
-            strtolower($expectedHash),
+        $valid = hash_equals(
+            strtolower($storedHash),
             $providedHash
+        );
+
+        if (!$valid) {
+            $this->recordFailedAttempt(
+                $rateLimitKey,
+                self::RESET_WINDOW_SECONDS
+            );
+
+            return false;
+        }
+
+        $this->clearFailedAttempts(
+            $rateLimitKey
+        );
+
+        return true;
+    }
+
+    /**
+     * Consume reset token once.
+     *
+     * Call this immediately after the token has been accepted
+     * and before completing the password-reset workflow.
+     */
+    public function consumeResetToken(
+        string $token
+    ): bool {
+        if (!$this->validateResetToken($token)) {
+            return false;
+        }
+
+        /*
+         * Single-use token.
+         */
+        $this->reset_token = null;
+
+        $this->save();
+
+        return true;
+    }
+
+    /**
+     * Check current user privilege using least privilege.
+     */
+    public static function currentUserHasRank(
+        int $requiredRank
+    ): bool {
+        if (
+            $requiredRank < self::RANK_GUEST
+            || $requiredRank > self::RANK_SUPER
+        ) {
+            return false;
+        }
+
+        $rank = \Base::instance()->get(
+            'user.rank'
+        );
+
+        $validatedRank = filter_var(
+            $rank,
+            FILTER_VALIDATE_INT
+        );
+
+        if ($validatedRank === false) {
+            return false;
+        }
+
+        return $validatedRank >= $requiredRank;
+    }
+
+    /**
+     * Enforce least privilege.
+     */
+    private function requireMinimumRank(
+        int $requiredRank
+    ): void {
+        if (
+            !self::currentUserHasRank(
+                $requiredRank
+            )
+        ) {
+            /*
+             * Do not reveal which permission or resource
+             * caused the authorization failure.
+             */
+            throw new \RuntimeException(
+                'Access denied.',
+                403
+            );
+        }
+    }
+
+    /**
+     * Select password hashing algorithm.
+     */
+    private function getPasswordAlgorithm()
+    {
+        if (
+            defined('PASSWORD_ARGON2ID')
+        ) {
+            return PASSWORD_ARGON2ID;
+        }
+
+        return PASSWORD_BCRYPT;
+    }
+
+    /**
+     * Password hashing parameters.
+     */
+    private function getPasswordOptions(
+        $algorithm
+    ): array {
+        if (
+            defined('PASSWORD_ARGON2ID')
+            && $algorithm === PASSWORD_ARGON2ID
+        ) {
+            return [
+                'memory_cost' =>
+                    self::ARGON_MEMORY_COST,
+                'time_cost' =>
+                    self::ARGON_TIME_COST,
+                'threads' =>
+                    self::ARGON_THREADS,
+            ];
+        }
+
+        return [
+            'cost' => self::BCRYPT_COST,
+        ];
+    }
+
+    /**
+     * Password policy.
+     *
+     * Passwords are validated, not "sanitized":
+     * modifying passwords would change the user's secret.
+     */
+    private function validatePassword(
+        string $password
+    ): void {
+        if (
+            !$this->isValidPasswordInput(
+                $password
+            )
+        ) {
+            throw new \InvalidArgumentException(
+                'Password does not satisfy security requirements.'
+            );
+        }
+    }
+
+    private function isValidPasswordInput(
+        string $password
+    ): bool {
+        $length = strlen($password);
+
+        if (
+            $length
+                < self::PASSWORD_MIN_LENGTH
+            || $length
+                > self::PASSWORD_MAX_LENGTH
+        ) {
+            return false;
+        }
+
+        /*
+         * Protect affected/legacy PHP environments and
+         * reject binary null characters in secrets.
+         */
+        if (str_contains($password, "\0")) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Dummy password verification used to reduce user
+     * enumeration through timing differences.
+     */
+    private function dummyPasswordVerification(): void
+    {
+        static $dummyHash = null;
+
+        if ($dummyHash === null) {
+            $algorithm =
+                $this->getPasswordAlgorithm();
+
+            $dummyHash = password_hash(
+                'DummyPassword-Only-For-Timing-Protection-9f4b1',
+                $algorithm,
+                $this->getPasswordOptions(
+                    $algorithm
+                )
+            );
+        }
+
+        if (is_string($dummyHash)) {
+            password_verify(
+                'InvalidPasswordValue',
+                $dummyHash
+            );
+        }
+    }
+
+    /**
+     * Normalize login identifier without altering
+     * legitimate password data.
+     */
+    private function normalizeIdentifier(
+        string $identifier
+    ): string {
+        $identifier = trim($identifier);
+
+        if (
+            $identifier === ''
+            || strlen($identifier)
+                > self::MAX_IDENTIFIER_LENGTH
+            || str_contains(
+                $identifier,
+                "\0"
+            )
+        ) {
+            return '';
+        }
+
+        return mb_strtolower(
+            $identifier,
+            'UTF-8'
+        );
+    }
+
+    private function normalizeClientKey(
+        string $clientKey
+    ): string {
+        $clientKey = trim($clientKey);
+
+        if (
+            $clientKey === ''
+            || strlen($clientKey) > 128
+        ) {
+            return 'unknown';
+        }
+
+        return hash(
+            'sha256',
+            $clientKey
         );
     }
 
     /**
-     * Validate a positive numeric identifier.
+     * Build a rate-limit key without storing usernames,
+     * emails or IP addresses in plaintext cache keys.
      */
-    private function validatePositiveId($value): ?int
-    {
+    private function buildLoginRateLimitKey(
+        string $identifier,
+        string $clientKey
+    ): string {
+        return 'security.login.' . hash(
+            'sha256',
+            $identifier .
+            '|' .
+            $clientKey
+        );
+    }
+
+    private function buildResetRateLimitKey(
+        int $userId
+    ): string {
+        return 'security.reset.' . hash(
+            'sha256',
+            (string) $userId
+        );
+    }
+
+    /**
+     * Server-side brute-force rate limiting.
+     *
+     * Fat-Free's cache must be enabled for persistence
+     * across requests.
+     */
+    private function isRateLimited(
+        string $key,
+        int $maximum =
+            self::LOGIN_MAX_ATTEMPTS
+    ): bool {
+        try {
+            $cache = \Cache::instance();
+
+            $value = null;
+
+            if (!$cache->exists(
+                $key,
+                $value
+            )) {
+                return false;
+            }
+
+            return (int) $value >= $maximum;
+        } catch (\Throwable $exception) {
+            /*
+             * Authentication must not expose cache details.
+             */
+            return false;
+        }
+    }
+
+    private function recordFailedAttempt(
+        string $key,
+        int $ttl =
+            self::LOGIN_WINDOW_SECONDS
+    ): void {
+        try {
+            $cache = \Cache::instance();
+
+            $current = null;
+
+            if (
+                $cache->exists(
+                    $key,
+                    $current
+                )
+            ) {
+                $attempts =
+                    (int) $current + 1;
+
+                /*
+                 * Clear first because Fat-Free retains
+                 * an existing cache entry's expiration.
+                 */
+                $cache->clear($key);
+            } else {
+                $attempts = 1;
+            }
+
+            $cache->set(
+                $key,
+                $attempts,
+                $ttl
+            );
+        } catch (\Throwable $exception) {
+            /*
+             * Do not leak infrastructure/cache failures.
+             */
+        }
+    }
+
+    private function clearFailedAttempts(
+        string $key
+    ): void {
+        try {
+            \Cache::instance()
+                ->clear($key);
+        } catch (\Throwable $exception) {
+            /*
+             * Avoid exposing infrastructure details.
+             */
+        }
+    }
+
+    private function validatePositiveId(
+        $value
+    ): ?int {
         $id = filter_var(
             $value,
             FILTER_VALIDATE_INT,
@@ -835,41 +1637,54 @@ class User extends \Model
             : $id;
     }
 
-    /**
-     * Sanitize a filename and prevent path traversal.
-     */
-    private function sanitizeFilename(string $filename): string
-    {
+    private function sanitizeFilename(
+        string $filename
+    ): string {
         $filename = trim($filename);
 
         if ($filename === '') {
             return '';
         }
 
-        $filename = basename($filename);
+        $filename = basename(
+            str_replace(
+                '\\',
+                '/',
+                $filename
+            )
+        );
 
-        return preg_replace(
+        $filename = preg_replace(
             '/[^a-zA-Z0-9._-]/',
             '',
             $filename
-        ) ?? '';
+        );
+
+        if (
+            $filename === null
+            || $filename === ''
+            || $filename === '.'
+            || $filename === '..'
+        ) {
+            return '';
+        }
+
+        return substr(
+            $filename,
+            0,
+            255
+        );
     }
 
-    /**
-     * Sanitize an option key.
-     */
-    private function sanitizeOptionKey(string $key): string
-    {
+    private function sanitizeOptionKey(
+        string $key
+    ): string {
         $key = trim($key);
 
         if ($key === '') {
             return '';
         }
 
-        /*
-         * Option names are identifiers, therefore control
-         * characters and unexpected symbols are rejected.
-         */
         $key = preg_replace(
             '/[^a-zA-Z0-9_.-]/',
             '',
@@ -880,22 +1695,68 @@ class User extends \Model
             return '';
         }
 
-        return substr($key, 0, 128);
+        return substr(
+            $key,
+            0,
+            128
+        );
+    }
+
+    private function isSensitiveOptionKey(
+        string $key
+    ): bool {
+        $normalized =
+            strtolower($key);
+
+        $sensitivePatterns = [
+            'password',
+            'passwd',
+            'secret',
+            'token',
+            'api_key',
+            'apikey',
+            'private_key',
+            'credential',
+            'authorization',
+        ];
+
+        foreach (
+            $sensitivePatterns
+            as $pattern
+        ) {
+            if (
+                str_contains(
+                    $normalized,
+                    $pattern
+                )
+            ) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
-     * Sanitize values stored in user options.
+     * Sanitize generic preference data.
      *
-     * Scalar strings have null/control characters removed.
-     * Arrays are sanitized recursively.
+     * Output encoding must still be performed
+     * at the rendering context.
      *
      * @param mixed $value
      *
      * @return mixed
      */
-    private function sanitizeOptionValue($value)
-    {
+    private function sanitizeOptionValue(
+        $value
+    ) {
         if (is_string($value)) {
+            if (strlen($value) > 16384) {
+                throw new \InvalidArgumentException(
+                    'Option value is too large.'
+                );
+            }
+
             $value = preg_replace(
                 '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u',
                 '',
@@ -906,22 +1767,47 @@ class User extends \Model
         }
 
         if (is_array($value)) {
-            $sanitized = [];
+            if (count($value) > 256) {
+                throw new \InvalidArgumentException(
+                    'Too many option values.'
+                );
+            }
 
-            foreach ($value as $key => $item) {
-                $cleanKey = is_string($key)
-                    ? $this->sanitizeOptionKey($key)
+            $result = [];
+
+            foreach (
+                $value
+                as $key => $item
+            ) {
+                $cleanKey =
+                    is_string($key)
+                    ? $this->sanitizeOptionKey(
+                        $key
+                    )
                     : $key;
 
                 if ($cleanKey === '') {
                     continue;
                 }
 
-                $sanitized[$cleanKey] =
-                    $this->sanitizeOptionValue($item);
+                if (
+                    is_string($cleanKey)
+                    && $this->isSensitiveOptionKey(
+                        $cleanKey
+                    )
+                ) {
+                    throw new \InvalidArgumentException(
+                        'Sensitive values cannot be stored as user options.'
+                    );
+                }
+
+                $result[$cleanKey] =
+                    $this->sanitizeOptionValue(
+                        $item
+                    );
             }
 
-            return $sanitized;
+            return $result;
         }
 
         if (
@@ -938,34 +1824,9 @@ class User extends \Model
         );
     }
 
-    /**
-     * Validate Y-m-d formatted date.
-     */
-    private function isValidDate(string $date): bool
-    {
-        if (
-            !preg_match(
-                '/^\d{4}-\d{2}-\d{2}$/D',
-                $date
-            )
-        ) {
-            return false;
-        }
-
-        $dateObject = \DateTimeImmutable::createFromFormat(
-            '!Y-m-d',
-            $date
-        );
-
-        return $dateObject !== false
-            && $dateObject->format('Y-m-d') === $date;
-    }
-
-    /**
-     * Sanitize language configuration.
-     */
-    private function sanitizeLanguage(string $language): string
-    {
+    private function sanitizeLanguage(
+        string $language
+    ): string {
         $language = explode(
             ',',
             $language,
@@ -986,4 +1847,38 @@ class User extends \Model
 
         return $language;
     }
+
+    private function isValidDate(
+        string $date
+    ): bool {
+        if (
+            !preg_match(
+                '/^\d{4}-\d{2}-\d{2}$/D',
+                $date
+            )
+        ) {
+            return false;
+        }
+
+        $object =
+            \DateTimeImmutable::createFromFormat(
+                '!Y-m-d',
+                $date
+            );
+
+        return $object !== false
+            && $object->format('Y-m-d')
+                === $date;
+    }
+
+    private function emptyStats(): array
+    {
+        return [
+            'labels' => [],
+            'spent' => [],
+            'closed' => [],
+            'created' => [],
+        ];
+    }
 }
+
