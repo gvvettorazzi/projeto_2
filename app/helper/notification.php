@@ -1,212 +1,452 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Helper;
 
 class Notification extends \Prefab
 {
     public const QPRINT_MAXL = 75;
 
+    private const MAX_EMAIL_LENGTH = 254;
+    private const MAX_SUBJECT_LENGTH = 998;
+    private const MIME_BOUNDARY_BYTES = 24;
+
     /**
-     * Convert a 8 bit string to a quoted-printable string
-     *
-     * Modified to add =2E instead of the leading double dot, see GH #238
-     *
-     * @link http://php.net/manual/en/function.quoted-printable-encode.php#115840
+     * Convert a string to quoted-printable.
      */
     public function quotePrintEncode(string $str): string
     {
-        $lp = 0;
-        $ret = '';
-        $hex = "0123456789ABCDEF";
-        $length = strlen($str);
-        $str_index = 0;
-
-        while ($length--) {
-            if ((($c = $str[$str_index++]) === "\015") && ($str[$str_index] == "\012") && $length > 0) {
-                $ret .= "\015";
-                $ret .= $str[$str_index++];
-                $length--;
-                $lp = 0;
-            } elseif (
-                ctype_cntrl((string)$c)
-                || (ord($c) == 0x7f)
-                || (ord($c) & 0x80)
-                || ($c === '=')
-                || (($c === ' ') && ($str[$str_index] == "\015"))
-            ) {
-                if (($lp += 3) > self::QPRINT_MAXL) {
-                    $ret .= '=';
-                    $ret .= "\015";
-                    $ret .= "\012";
-                    $lp = 3;
-                }
-
-                $ret .= '=';
-                $ret .= $hex[ord($c) >> 4];
-                $ret .= $hex[ord($c) & 0xf];
-            } else {
-                if ((++$lp) > self::QPRINT_MAXL) {
-                    $ret .= '=';
-                    $ret .= "\015";
-                    $ret .= "\012";
-                    $lp = 1;
-                }
-
-                $ret .= $c;
-                if ($lp == 1 && $c === '.') {
-                    $ret = substr($ret, 0, strlen($ret) - 1);
-                    $ret .= '=2E';
-                    $lp++;
-                }
-            }
-        }
-
-        return $ret;
+        return quoted_printable_encode($str);
     }
 
     /**
-     * Send an email with the UTF-8 character set
-     * @param string $body The HTML body part
-     * @param string|null $text The plaintext body part (optional)
+     * Send an email using UTF-8.
+     *
+     * Includes:
+     * - recipient validation
+     * - sender validation
+     * - header injection protection
+     * - cryptographically secure MIME boundary
+     * - no MD5/SHA-1 usage
      */
-    public function utf8mail(string $to, string $subject, string $body, ?string $text = null): bool
-    {
+    public function utf8mail(
+        string $to,
+        string $subject,
+        string $body,
+        ?string $text = null
+    ): bool {
         $f3 = \Base::instance();
 
-        // Add basic headers
-        $headers  = 'MIME-Version: 1.0' . "\r\n";
-        $headers .= 'From: ' . $f3->get("mail.from") . "\r\n";
+        $recipient = $this->validateEmail($to);
 
-        // Build multipart message if necessary
-        if ($text !== null && $text !== '') {
-            // Generate message breaking hash
-            $hash = md5(date("r"));
-            $headers .= "Content-Type: multipart/alternative; boundary=\"{$hash}\"\r\n";
+        if ($recipient === null) {
+            return false;
+        }
 
-            // Normalize line endings
-            $body = str_replace("\r\n", "\n", $body);
-            $body = str_replace("\n", "\r\n", $body);
-            $text = str_replace("\r\n", "\n", $text);
-            $text = str_replace("\n", "\r\n", $text);
+        $from = $this->validateEmail(
+            (string) $f3->get('mail.from')
+        );
 
-            // Encode content
-            $body = $this->quotePrintEncode($body);
-            $text = $this->quotePrintEncode($text);
+        if ($from === null) {
+            return false;
+        }
 
-            // Build final message
-            $msg = "--{$hash}\r\n";
-            $msg .= "Content-Type: text/plain; charset=utf-8\r\n";
-            $msg .= "Content-Transfer-Encoding: quoted-printable\r\n";
-            $msg .= "\r\n" . $text . "\r\n";
-            $msg .= "--{$hash}\r\n";
-            $msg .= "Content-Type: text/html; charset=utf-8\r\n";
-            $msg .= "Content-Transfer-Encoding: quoted-printable\r\n";
-            $msg .= "\r\n" . $body . "\r\n";
-            $msg .= "--{$hash}--\r\n";
+        $subject = $this->sanitizeHeaderValue(
+            $subject
+        );
 
-            $body = $msg;
+        if ($subject === '') {
+            return false;
+        }
+
+        $headers = [];
+
+        $headers[] = 'MIME-Version: 1.0';
+        $headers[] = 'From: ' . $from;
+
+        if (
+            $text !== null
+            && $text !== ''
+        ) {
+            /*
+             * Cryptographically secure MIME boundary.
+             *
+             * Replaces the previous:
+             * md5(date("r"))
+             */
+            $boundary =
+                '=_phproject_'
+                . bin2hex(
+                    random_bytes(
+                        self::MIME_BOUNDARY_BYTES
+                    )
+                );
+
+            $headers[] =
+                'Content-Type: multipart/alternative; boundary="'
+                . $boundary
+                . '"';
+
+            $normalizedText =
+                $this->normalizeMailLineEndings(
+                    $text
+                );
+
+            $normalizedBody =
+                $this->normalizeMailLineEndings(
+                    $body
+                );
+
+            $encodedText =
+                $this->quotePrintEncode(
+                    $normalizedText
+                );
+
+            $encodedBody =
+                $this->quotePrintEncode(
+                    $normalizedBody
+                );
+
+            $message = '';
+
+            $message .=
+                '--'
+                . $boundary
+                . "\r\n";
+
+            $message .=
+                "Content-Type: text/plain; charset=utf-8\r\n";
+
+            $message .=
+                "Content-Transfer-Encoding: quoted-printable\r\n\r\n";
+
+            $message .=
+                $encodedText
+                . "\r\n";
+
+            $message .=
+                '--'
+                . $boundary
+                . "\r\n";
+
+            $message .=
+                "Content-Type: text/html; charset=utf-8\r\n";
+
+            $message .=
+                "Content-Transfer-Encoding: quoted-printable\r\n\r\n";
+
+            $message .=
+                $encodedBody
+                . "\r\n";
+
+            $message .=
+                '--'
+                . $boundary
+                . "--\r\n";
+
+            $body = $message;
         } else {
-            $headers .= "Content-Type: text/html; charset=utf-8\r\n";
+            $headers[] =
+                'Content-Type: text/html; charset=utf-8';
+
+            $headers[] =
+                'Content-Transfer-Encoding: quoted-printable';
+
+            $body =
+                $this->quotePrintEncode(
+                    $this->normalizeMailLineEndings(
+                        $body
+                    )
+                );
         }
 
-        return mail($to, $subject, $body, $headers);
+        return mail(
+            $recipient,
+            $subject,
+            $body,
+            implode(
+                "\r\n",
+                $headers
+            )
+        );
     }
 
     /**
-     * Send an email to watchers with the comment body
+     * Send an email to watchers with the comment body.
      */
-    public function issue_comment(int $issue_id, int $comment_id): void
-    {
+    public function issue_comment(
+        int $issue_id,
+        int $comment_id
+    ): void {
+        if (
+            $issue_id <= 0
+            || $comment_id <= 0
+        ) {
+            return;
+        }
+
         $f3 = \Base::instance();
-        if ($f3->get("mail.from")) {
-            $log = new \Log("mail.log");
 
-            // Get issue and comment data
-            $issue = new \Model\Issue();
-            $issue->load($issue_id);
-            $comment = new \Model\Issue\Comment\Detail();
-            $comment->load($comment_id);
+        if (!$f3->get('mail.from')) {
+            return;
+        }
 
-            // Get issue parent if set
-            if ($issue->parent_id) {
-                $parent = new \Model\Issue();
-                $parent->load($issue->parent_id);
-                $f3->set("parent", $parent);
-            }
+        $log = new \Log(
+            'mail.log'
+        );
 
-            // Get recipient list and remove current user
-            $recipients = $this->_issue_watchers($issue_id);
-            $recipients = array_diff($recipients, [$comment->user_email]);
+        $issue =
+            new \Model\Issue();
 
-            // Render message body
-            $f3->set("issue", $issue);
-            $f3->set("comment", $comment);
-            $f3->set("previewText", $comment->text);
-            $text = $this->_render("notification/comment.txt");
-            $body = $this->_render("notification/comment.html");
+        $issue->load(
+            $issue_id
+        );
 
-            $subject = "[#{$issue->id}] - New comment on {$issue->name}";
+        $comment =
+            new \Model\Issue\Comment\Detail();
 
-            // Send to recipients
-            foreach ($recipients as $recipient) {
-                $this->utf8mail($recipient, $subject, $body, $text);
-                $log->write("Sent comment notification to: " . $recipient);
+        $comment->load(
+            $comment_id
+        );
+
+        if (
+            !$issue->id
+            || !$comment->id
+        ) {
+            return;
+        }
+
+        if ($issue->parent_id) {
+            $parent =
+                new \Model\Issue();
+
+            $parent->load(
+                $issue->parent_id
+            );
+
+            $f3->set(
+                'parent',
+                $parent
+            );
+        }
+
+        $recipients =
+            $this->_issue_watchers(
+                $issue_id
+            );
+
+        $recipients =
+            array_diff(
+                $recipients,
+                [
+                    (string) $comment->user_email,
+                ]
+            );
+
+        $f3->set(
+            'issue',
+            $issue
+        );
+
+        $f3->set(
+            'comment',
+            $comment
+        );
+
+        $f3->set(
+            'previewText',
+            $comment->text
+        );
+
+        $text =
+            $this->_render(
+                'notification/comment.txt'
+            );
+
+        $body =
+            $this->_render(
+                'notification/comment.html'
+            );
+
+        $subject =
+            '[#'
+            . (int) $issue->id
+            . '] - New comment on '
+            . $this->sanitizeSubjectPart(
+                (string) $issue->name
+            );
+
+        foreach ($recipients as $recipient) {
+            if (
+                $this->utf8mail(
+                    $recipient,
+                    $subject,
+                    $body,
+                    $text
+                )
+            ) {
+                /*
+                 * Avoid writing PII/e-mail addresses
+                 * into logs.
+                 */
+                $log->write(
+                    'Comment notification sent.'
+                );
             }
         }
     }
 
     /**
-     * Send an email to watchers detailing the updated fields
+     * Send an email to watchers detailing updated fields.
      */
-    public function issue_update(int $issue_id, int $update_id): ?bool
-    {
+    public function issue_update(
+        int $issue_id,
+        int $update_id
+    ): ?bool {
+        if (
+            $issue_id <= 0
+            || $update_id <= 0
+        ) {
+            return false;
+        }
+
         $f3 = \Base::instance();
-        if ($f3->get("mail.from")) {
-            $log = new \Log("mail.log");
 
-            // Get issue and update data
-            $issue = new \Model\Issue();
-            $issue->load($issue_id);
-            $f3->set("issue", $issue);
-            $update = new \Model\Custom("issue_update_detail");
-            $update->load($update_id);
+        if (!$f3->get('mail.from')) {
+            return null;
+        }
 
-            // Get issue parent if set
-            if ($issue->parent_id) {
-                $parent = new \Model\Issue();
-                $parent->load($issue->parent_id);
-                $f3->set("parent", $parent);
-            }
+        $log =
+            new \Log(
+                'mail.log'
+            );
 
-            // Avoid errors from bad calls
-            if (!$issue->id || !$update->id) {
-                return false;
-            }
+        $issue =
+            new \Model\Issue();
 
-            $changes = new \Model\Issue\Update\Field();
-            $f3->set("changes", $changes->find(["issue_update_id = ?", $update->id]));
+        $issue->load(
+            $issue_id
+        );
 
-            // Get recipient list and remove update user
-            $recipients = $this->_issue_watchers($issue_id);
-            $recipients = array_diff($recipients, [$update->user_email]);
+        $update =
+            new \Model\Custom(
+                'issue_update_detail'
+            );
 
-            // Render message body
-            $f3->set("issue", $issue);
-            $f3->set("update", $update);
-            $text = $this->_render("notification/update.txt");
-            $body = $this->_render("notification/update.html");
+        $update->load(
+            $update_id
+        );
 
-            $changes->load(["issue_update_id = ? AND `field` = 'closed_date' AND old_value = '' and new_value != ''", $update->id]);
-            if ($changes && $changes->id) {
-                $subject = "[#{$issue->id}] - {$issue->name} closed";
-            } else {
-                $subject =  "[#{$issue->id}] - {$issue->name} updated";
-            }
+        if (
+            !$issue->id
+            || !$update->id
+        ) {
+            return false;
+        }
 
-            // Send to recipients
-            foreach ($recipients as $recipient) {
-                $this->utf8mail($recipient, $subject, $body, $text);
-                $log->write("Sent update notification to: " . $recipient);
+        $f3->set(
+            'issue',
+            $issue
+        );
+
+        if ($issue->parent_id) {
+            $parent =
+                new \Model\Issue();
+
+            $parent->load(
+                $issue->parent_id
+            );
+
+            $f3->set(
+                'parent',
+                $parent
+            );
+        }
+
+        $changes =
+            new \Model\Issue\Update\Field();
+
+        $f3->set(
+            'changes',
+            $changes->find([
+                'issue_update_id = ?',
+                $update->id,
+            ])
+        );
+
+        $recipients =
+            $this->_issue_watchers(
+                $issue_id
+            );
+
+        $recipients =
+            array_diff(
+                $recipients,
+                [
+                    (string) $update->user_email,
+                ]
+            );
+
+        $f3->set(
+            'update',
+            $update
+        );
+
+        $text =
+            $this->_render(
+                'notification/update.txt'
+            );
+
+        $body =
+            $this->_render(
+                'notification/update.html'
+            );
+
+        $changes->load([
+            "issue_update_id = ?
+             AND `field` = 'closed_date'
+             AND old_value = ''
+             AND new_value != ''",
+            $update->id,
+        ]);
+
+        $issueName =
+            $this->sanitizeSubjectPart(
+                (string) $issue->name
+            );
+
+        if (
+            $changes
+            && $changes->id
+        ) {
+            $subject =
+                '[#'
+                . (int) $issue->id
+                . '] - '
+                . $issueName
+                . ' closed';
+        } else {
+            $subject =
+                '[#'
+                . (int) $issue->id
+                . '] - '
+                . $issueName
+                . ' updated';
+        }
+
+        foreach ($recipients as $recipient) {
+            if (
+                $this->utf8mail(
+                    $recipient,
+                    $subject,
+                    $body,
+                    $text
+                )
+            ) {
+                $log->write(
+                    'Update notification sent.'
+                );
             }
         }
 
@@ -214,194 +454,769 @@ class Notification extends \Prefab
     }
 
     /**
-     * Send an email to watchers detailing the updated fields
+     * Send an email to watchers when an issue is created.
      */
-    public function issue_create(int $issue_id): void
-    {
+    public function issue_create(
+        int $issue_id
+    ): void {
+        if ($issue_id <= 0) {
+            return;
+        }
+
         $f3 = \Base::instance();
-        $log = new \Log("mail.log");
-        if ($f3->get("mail.from")) {
-            $log = new \Log("mail.log");
 
-            // Get issue and update data
-            $issue = new \Model\Issue\Detail();
-            $issue->load($issue_id);
-            $f3->set("issue", $issue);
+        if (!$f3->get('mail.from')) {
+            return;
+        }
 
-            // Get issue parent if set
-            if ($issue->parent_id) {
-                $parent = new \Model\Issue();
-                $parent->load($issue->parent_id);
-                $f3->set("parent", $parent);
-            }
+        $log =
+            new \Log(
+                'mail.log'
+            );
 
-            // Get recipient list, conditionally removing the author
-            $recipients = $this->_issue_watchers($issue_id);
-            $user = new \Model\User();
-            $user->load($issue->author_id);
-            if ($user->option('disable_self_notifications')) {
-                $recipients = array_diff($recipients, [$user->email]);
-            }
+        $issue =
+            new \Model\Issue\Detail();
 
-            // Render message body
-            $f3->set("issue", $issue);
+        $issue->load(
+            $issue_id
+        );
 
-            $text = $this->_render("notification/new.txt");
-            $body = $this->_render("notification/new.html");
+        if (!$issue->id) {
+            return;
+        }
 
-            $subject = "[#{$issue->id}] - {$issue->name} created by {$issue->author_name}";
+        $f3->set(
+            'issue',
+            $issue
+        );
 
-            // Send to recipients
-            foreach ($recipients as $recipient) {
-                $this->utf8mail($recipient, $subject, $body, $text);
-                $log->write("Sent create notification to: " . $recipient);
+        if ($issue->parent_id) {
+            $parent =
+                new \Model\Issue();
+
+            $parent->load(
+                $issue->parent_id
+            );
+
+            $f3->set(
+                'parent',
+                $parent
+            );
+        }
+
+        $recipients =
+            $this->_issue_watchers(
+                $issue_id
+            );
+
+        $user =
+            new \Model\User();
+
+        $user->load(
+            $issue->author_id
+        );
+
+        if (
+            $user->id
+            && $user->option(
+                'disable_self_notifications'
+            )
+        ) {
+            $recipients =
+                array_diff(
+                    $recipients,
+                    [
+                        (string) $user->email,
+                    ]
+                );
+        }
+
+        $text =
+            $this->_render(
+                'notification/new.txt'
+            );
+
+        $body =
+            $this->_render(
+                'notification/new.html'
+            );
+
+        $subject =
+            '[#'
+            . (int) $issue->id
+            . '] - '
+            . $this->sanitizeSubjectPart(
+                (string) $issue->name
+            )
+            . ' created by '
+            . $this->sanitizeSubjectPart(
+                (string) $issue->author_name
+            );
+
+        foreach ($recipients as $recipient) {
+            if (
+                $this->utf8mail(
+                    $recipient,
+                    $subject,
+                    $body,
+                    $text
+                )
+            ) {
+                $log->write(
+                    'Create notification sent.'
+                );
             }
         }
     }
 
     /**
-     * Send an email to watchers with the file info
+     * Send an email to watchers when a file is attached.
      */
-    public function issue_file(int $issue_id, int $file_id): void
-    {
-        $f3 = \Base::instance();
-        if ($f3->get("mail.from")) {
-            $log = new \Log("mail.log");
+    public function issue_file(
+        int $issue_id,
+        int $file_id
+    ): void {
+        if (
+            $issue_id <= 0
+            || $file_id <= 0
+        ) {
+            return;
+        }
 
-            // Get issue and comment data
-            $issue = new \Model\Issue();
-            $issue->load($issue_id);
-            $file = new \Model\Issue\File\Detail();
-            $file->load($file_id);
+        $f3 =
+            \Base::instance();
 
-            // This should catch a bug I can't currently find the source of. --Alan
-            if ($file->issue_id != $issue->id) {
-                return;
-            }
+        if (!$f3->get('mail.from')) {
+            return;
+        }
 
-            // Get issue parent if set
-            if ($issue->parent_id) {
-                $parent = new \Model\Issue();
-                $parent->load($issue->parent_id);
-                $f3->set("parent", $parent);
-            }
+        $log =
+            new \Log(
+                'mail.log'
+            );
 
-            // Get recipient list and remove current user
-            $recipients = $this->_issue_watchers($issue_id);
-            $recipients = array_diff($recipients, [$file->user_email]);
+        $issue =
+            new \Model\Issue();
 
-            // Render message body
-            $f3->set("issue", $issue);
-            $f3->set("file", $file);
-            $f3->set("previewText", $file->filename);
-            $text = $this->_render("notification/file.txt");
-            $body = $this->_render("notification/file.html");
+        $issue->load(
+            $issue_id
+        );
 
-            $subject =  "[#{$issue->id}] - {$file->user_name} attached a file to {$issue->name}";
+        $file =
+            new \Model\Issue\File\Detail();
 
-            // Send to recipients
-            foreach ($recipients as $recipient) {
-                $this->utf8mail($recipient, $subject, $body, $text);
-                $log->write("Sent file notification to: " . $recipient);
+        $file->load(
+            $file_id
+        );
+
+        if (
+            !$issue->id
+            || !$file->id
+        ) {
+            return;
+        }
+
+        /*
+         * Ensure file belongs to the same issue.
+         */
+        if (
+            (int) $file->issue_id
+            !== (int) $issue->id
+        ) {
+            return;
+        }
+
+        if ($issue->parent_id) {
+            $parent =
+                new \Model\Issue();
+
+            $parent->load(
+                $issue->parent_id
+            );
+
+            $f3->set(
+                'parent',
+                $parent
+            );
+        }
+
+        $recipients =
+            $this->_issue_watchers(
+                $issue_id
+            );
+
+        $recipients =
+            array_diff(
+                $recipients,
+                [
+                    (string) $file->user_email,
+                ]
+            );
+
+        $f3->set(
+            'issue',
+            $issue
+        );
+
+        $f3->set(
+            'file',
+            $file
+        );
+
+        $f3->set(
+            'previewText',
+            $file->filename
+        );
+
+        $text =
+            $this->_render(
+                'notification/file.txt'
+            );
+
+        $body =
+            $this->_render(
+                'notification/file.html'
+            );
+
+        $subject =
+            '[#'
+            . (int) $issue->id
+            . '] - '
+            . $this->sanitizeSubjectPart(
+                (string) $file->user_name
+            )
+            . ' attached a file to '
+            . $this->sanitizeSubjectPart(
+                (string) $issue->name
+            );
+
+        foreach ($recipients as $recipient) {
+            if (
+                $this->utf8mail(
+                    $recipient,
+                    $subject,
+                    $body,
+                    $text
+                )
+            ) {
+                $log->write(
+                    'File notification sent.'
+                );
             }
         }
     }
 
     /**
-     * Send a user a password reset email
+     * Send a password-reset email.
      */
-    public function user_reset(int $user_id, string $token): void
-    {
-        $f3 = \Base::instance();
-        if ($f3->get("mail.from")) {
-            $user = new \Model\User();
-            $user->load($user_id);
-
-            if (!$user->id) {
-                throw new \Exception("User does not exist.");
-            }
-
-            // Render message body
-            $f3->set("token", $token);
-            $text = $this->_render("notification/user_reset.txt");
-            $body = $this->_render("notification/user_reset.html");
-
-            // Send email to user
-            $subject = "Reset your password - " . $f3->get("site.name");
-            $this->utf8mail($user->email, $subject, $body, $text);
+    public function user_reset(
+        int $user_id,
+        string $token
+    ): void {
+        if (
+            $user_id <= 0
+            || !$this->isValidResetToken(
+                $token
+            )
+        ) {
+            return;
         }
+
+        $f3 =
+            \Base::instance();
+
+        if (!$f3->get('mail.from')) {
+            return;
+        }
+
+        $user =
+            new \Model\User();
+
+        $user->load(
+            $user_id
+        );
+
+        /*
+         * Do not expose whether a user exists through
+         * exception text from this helper.
+         */
+        if (
+            !$user->id
+            || $this->validateEmail(
+                (string) $user->email
+            ) === null
+        ) {
+            return;
+        }
+
+        $f3->set(
+            'token',
+            $token
+        );
+
+        $text =
+            $this->_render(
+                'notification/user_reset.txt'
+            );
+
+        $body =
+            $this->_render(
+                'notification/user_reset.html'
+            );
+
+        $siteName =
+            $this->sanitizeSubjectPart(
+                (string) $f3->get(
+                    'site.name'
+                )
+            );
+
+        $subject =
+            'Reset your password - '
+            . $siteName;
+
+        $this->utf8mail(
+            (string) $user->email,
+            $subject,
+            $body,
+            $text
+        );
+
+        /*
+         * Do not log the reset token or user email.
+         */
     }
 
     /**
-     * Send a user an email listing the issues due today and any overdue issues
+     * Send a user due/overdue issue email.
      */
-    public function user_due_issues(\Model\User $user, array $due, array $overdue): bool
-    {
-        $f3 = \Base::instance();
-        if ($f3->get("mail.from")) {
-            $f3->set("due", $due);
-            $f3->set("overdue", $overdue);
-            $preview = count($due) . " issues due today";
-            if ($overdue !== []) {
-                $preview .= ", " . count($overdue) . " overdue issues";
-            }
+    public function user_due_issues(
+        \Model\User $user,
+        array $due,
+        array $overdue
+    ): bool {
+        $f3 =
+            \Base::instance();
 
-            $f3->set("previewText", $preview);
-            $subject = "Due Today - " . $f3->get("site.name");
-            $text = $this->_render("notification/user_due_issues.txt");
-            $body = $this->_render("notification/user_due_issues.html");
-            return $this->utf8mail($user->email, $subject, $body, $text);
+        if (!$f3->get('mail.from')) {
+            return false;
         }
 
-        return false;
+        $email =
+            $this->validateEmail(
+                (string) $user->email
+            );
+
+        if ($email === null) {
+            return false;
+        }
+
+        $f3->set(
+            'due',
+            $due
+        );
+
+        $f3->set(
+            'overdue',
+            $overdue
+        );
+
+        $preview =
+            count($due)
+            . ' issues due today';
+
+        if ($overdue !== []) {
+            $preview .=
+                ', '
+                . count($overdue)
+                . ' overdue issues';
+        }
+
+        $f3->set(
+            'previewText',
+            $preview
+        );
+
+        $siteName =
+            $this->sanitizeSubjectPart(
+                (string) $f3->get(
+                    'site.name'
+                )
+            );
+
+        $subject =
+            'Due Today - '
+            . $siteName;
+
+        $text =
+            $this->_render(
+                'notification/user_due_issues.txt'
+            );
+
+        $body =
+            $this->_render(
+                'notification/user_due_issues.html'
+            );
+
+        return $this->utf8mail(
+            $email,
+            $subject,
+            $body,
+            $text
+        );
     }
 
     /**
-     * Get array of email addresses of all watchers on an issue
+     * Get unique validated watcher email addresses.
      */
-    protected function _issue_watchers(int $issue_id): array
-    {
-        $db = \Base::instance()->get("db.instance");
+    protected function _issue_watchers(
+        int $issue_id
+    ): array {
+        if ($issue_id <= 0) {
+            return [];
+        }
+
+        $db =
+            \Base::instance()
+                ->get(
+                    'db.instance'
+                );
+
+        if (!$db) {
+            return [];
+        }
+
         $recipients = [];
 
-        // Add issue author and owner
-        $result = $db->exec("SELECT u.email FROM issue i INNER JOIN `user` u on i.author_id = u.id WHERE u.deleted_date IS NULL AND i.id = ?", $issue_id);
-        if (!empty($result[0]["email"])) {
-            $recipients[] = $result[0]["email"];
+        /*
+         * Author.
+         */
+        $result = $db->exec(
+            'SELECT u.email
+             FROM issue i
+             INNER JOIN `user` u
+                 ON i.author_id = u.id
+             WHERE u.deleted_date IS NULL
+               AND i.id = ?',
+            $issue_id
+        );
+
+        if (
+            !empty(
+                $result[0]['email']
+            )
+        ) {
+            $this->appendValidRecipient(
+                $recipients,
+                (string) $result[0]['email']
+            );
         }
 
+        /*
+         * Owner.
+         */
+        $result = $db->exec(
+            'SELECT u.email
+             FROM issue i
+             INNER JOIN `user` u
+                 ON i.owner_id = u.id
+             WHERE u.deleted_date IS NULL
+               AND i.id = ?',
+            $issue_id
+        );
 
-        $result = $db->exec("SELECT u.email FROM issue i INNER JOIN `user` u on i.owner_id = u.id WHERE u.deleted_date IS NULL AND i.id = ?", $issue_id);
-        if (!empty($result[0]["email"])) {
-            $recipients[] = $result[0]["email"];
+        if (
+            !empty(
+                $result[0]['email']
+            )
+        ) {
+            $this->appendValidRecipient(
+                $recipients,
+                (string) $result[0]['email']
+            );
         }
 
-        // Add whole group
-        $result = $db->exec("SELECT u.role, u.id FROM issue i INNER JOIN `user` u on i.owner_id = u.id  WHERE u.deleted_date IS NULL AND i.id = ?", $issue_id);
-        if ($result && $result[0]["role"] == 'group') {
-            $group_users = $db->exec("SELECT g.user_email FROM user_group_user g WHERE g.deleted_date IS NULL AND g.group_id = ?", $result[0]["id"]);
-            foreach ($group_users as $group_user) {
-                if (!empty($group_user["user_email"])) {
-                    $recipients[] = $group_user["user_email"];
+        /*
+         * Determine whether the owner is a group.
+         */
+        $result = $db->exec(
+            'SELECT u.role, u.id
+             FROM issue i
+             INNER JOIN `user` u
+                 ON i.owner_id = u.id
+             WHERE u.deleted_date IS NULL
+               AND i.id = ?',
+            $issue_id
+        );
+
+        if (
+            !empty($result[0])
+            && ($result[0]['role'] ?? null)
+                === 'group'
+        ) {
+            $groupId =
+                filter_var(
+                    $result[0]['id'] ?? null,
+                    FILTER_VALIDATE_INT,
+                    [
+                        'options' => [
+                            'min_range' => 1,
+                        ],
+                    ]
+                );
+
+            if ($groupId !== false) {
+                $groupUsers = $db->exec(
+                    'SELECT g.user_email
+                     FROM user_group_user g
+                     WHERE g.deleted_date IS NULL
+                       AND g.group_id = ?',
+                    $groupId
+                );
+
+                foreach (
+                    $groupUsers
+                    as $groupUser
+                ) {
+                    if (
+                        !empty(
+                            $groupUser[
+                                'user_email'
+                            ]
+                        )
+                    ) {
+                        $this->appendValidRecipient(
+                            $recipients,
+                            (string) $groupUser[
+                                'user_email'
+                            ]
+                        );
+                    }
                 }
             }
         }
 
-        // Add watchers
-        $watchers = $db->exec("SELECT u.email FROM issue_watcher w INNER JOIN `user` u ON w.user_id = u.id WHERE u.deleted_date IS NULL AND issue_id = ?", $issue_id);
+        /*
+         * Issue watchers.
+         */
+        $watchers = $db->exec(
+            'SELECT u.email
+             FROM issue_watcher w
+             INNER JOIN `user` u
+                 ON w.user_id = u.id
+             WHERE u.deleted_date IS NULL
+               AND w.issue_id = ?',
+            $issue_id
+        );
+
         foreach ($watchers as $watcher) {
-            $recipients[] = $watcher["email"];
+            if (
+                !empty(
+                    $watcher['email']
+                )
+            ) {
+                $this->appendValidRecipient(
+                    $recipients,
+                    (string) $watcher['email']
+                );
+            }
         }
 
-        // Remove duplicate users
-        return array_unique($recipients);
+        return array_values(
+            array_unique(
+                $recipients
+            )
+        );
     }
 
     /**
-     * Render a view and return the result
+     * Render a notification template.
      */
-    protected function _render(string $file, string $mime = "text/html", ?array $hive = null, int $ttl = 0): string
-    {
-        return \Helper\View::instance()->render($file, $mime, $hive, $ttl);
+    protected function _render(
+        string $file,
+        string $mime = 'text/html',
+        ?array $hive = null,
+        int $ttl = 0
+    ): string {
+        if (
+            !$this->isValidTemplatePath(
+                $file
+            )
+        ) {
+            throw new \InvalidArgumentException(
+                'Invalid notification template.'
+            );
+        }
+
+        return \Helper\View::instance()
+            ->render(
+                $file,
+                $mime,
+                $hive,
+                $ttl
+            );
+    }
+
+    /**
+     * Normalize line endings to RFC-style CRLF.
+     */
+    private function normalizeMailLineEndings(
+        string $value
+    ): string {
+        $value = str_replace(
+            [
+                "\r\n",
+                "\r",
+            ],
+            "\n",
+            $value
+        );
+
+        return str_replace(
+            "\n",
+            "\r\n",
+            $value
+        );
+    }
+
+    /**
+     * Validate email address.
+     */
+    private function validateEmail(
+        string $email
+    ): ?string {
+        $email =
+            trim($email);
+
+        if (
+            $email === ''
+            || strlen($email)
+                > self::MAX_EMAIL_LENGTH
+            || preg_match(
+                '/[\r\n]/',
+                $email
+            )
+        ) {
+            return null;
+        }
+
+        $validated =
+            filter_var(
+                $email,
+                FILTER_VALIDATE_EMAIL
+            );
+
+        return $validated === false
+            ? null
+            : $validated;
+    }
+
+    /**
+     * Remove header control characters.
+     */
+    private function sanitizeHeaderValue(
+        string $value
+    ): string {
+        $value =
+            preg_replace(
+                '/[\r\n\x00-\x08\x0B\x0C\x0E-\x1F\x7F]+/',
+                ' ',
+                $value
+            ) ?? '';
+
+        $value =
+            trim(
+                preg_replace(
+                    '/\s+/u',
+                    ' ',
+                    $value
+                ) ?? ''
+            );
+
+        return substr(
+            $value,
+            0,
+            self::MAX_SUBJECT_LENGTH
+        );
+    }
+
+    /**
+     * Sanitize interpolated subject fragments.
+     */
+    private function sanitizeSubjectPart(
+        string $value
+    ): string {
+        return $this->sanitizeHeaderValue(
+            $value
+        );
+    }
+
+    /**
+     * Append only valid recipients.
+     */
+    private function appendValidRecipient(
+        array &$recipients,
+        string $email
+    ): void {
+        $validated =
+            $this->validateEmail(
+                $email
+            );
+
+        if ($validated !== null) {
+            $recipients[] =
+                $validated;
+        }
+    }
+
+    /**
+     * Reset tokens generated by the hardened User model
+     * are 64 hexadecimal characters.
+     */
+    private function isValidResetToken(
+        string $token
+    ): bool {
+        return strlen($token) === 64
+            && ctype_xdigit(
+                $token
+            );
+    }
+
+    /**
+     * Only allow known-style notification templates.
+     *
+     * Prevents path traversal if this method is reused
+     * with dynamic input in the future.
+     */
+    private function isValidTemplatePath(
+        string $file
+    ): bool {
+        if (
+            $file === ''
+            || strlen($file) > 255
+            || str_contains(
+                $file,
+                "\0"
+            )
+            || str_contains(
+                $file,
+                '..'
+            )
+            || str_starts_with(
+                $file,
+                '/'
+            )
+            || str_starts_with(
+                $file,
+                '\\'
+            )
+        ) {
+            return false;
+        }
+
+        return (bool) preg_match(
+            '#^[a-zA-Z0-9/_\.-]+$#D',
+            $file
+        );
     }
 }
