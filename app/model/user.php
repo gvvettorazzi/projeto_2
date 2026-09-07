@@ -33,40 +33,51 @@ class User extends \Model
     public const RANK_ADMIN = 4;
     public const RANK_SUPER = 5;
 
-    protected $_table_name = "user";
-    protected $_groupUsers;
+    private const RESET_TOKEN_HASH_LENGTH = 96;
+
+    protected $_table_name = 'user';
+
+    protected $_groupUsers = null;
 
     /**
-     * Load currently logged in user, if any
+     * Load currently logged-in user, if any.
      */
     public function loadCurrent(): static
     {
         $f3 = \Base::instance();
 
-        // Load current session
         $session = new Session();
         $session->loadCurrent();
 
-        // Load user
-        if ($session->user_id) {
-            $this->load(["id = ? AND deleted_date IS NULL", $session->user_id]);
-            if ($this->id) {
-                $f3->set("user", $this->cast());
-                $f3->set("user_obj", $this);
+        $userId = (int) ($session->user_id ?? 0);
 
-                // Change default language if user has selected one
-                if ($this->exists("language") && $this->language) {
-                    $f3->set("LANGUAGE", $this->language);
-                }
-            }
+        if ($userId <= 0) {
+            return $this;
+        }
+
+        $this->load([
+            'id = ? AND deleted_date IS NULL',
+            $userId,
+        ]);
+
+        if (!$this->id) {
+            return $this;
+        }
+
+        $f3->set('user', $this->cast());
+        $f3->set('user_obj', $this);
+
+        if ($this->exists('language') && !empty($this->language)) {
+            $f3->set('LANGUAGE', $this->language);
         }
 
         return $this;
     }
 
     /**
-     * Get path to user's avatar or gravatar
-     * @return string|bool
+     * Get path to user's avatar or Gravatar.
+     *
+     * @return string|false
      */
     public function avatar(int $size = 80)
     {
@@ -74,139 +85,256 @@ class User extends \Model
             return false;
         }
 
-        if ($this->get("avatar_filename") && is_file("uploads/avatars/" . $this->get("avatar_filename"))) {
-            return \Base::instance()->get('BASE') . "/avatar/{$size}-{$this->id}.png";
+        $size = max(1, $size);
+
+        $avatarFilename = (string) $this->get('avatar_filename');
+
+        if ($avatarFilename !== '') {
+            $avatarPath = 'uploads/avatars/' . basename($avatarFilename);
+
+            if (is_file($avatarPath)) {
+                return sprintf(
+                    '%s/avatar/%d-%d.png',
+                    \Base::instance()->get('BASE'),
+                    $size,
+                    $this->id
+                );
+            }
         }
 
-        return \Helper\View::instance()->gravatar($this->get("email"), $size);
+        return \Helper\View::instance()->gravatar(
+            (string) $this->get('email'),
+            $size
+        );
     }
 
     /**
-     * Load all active users
+     * Load all active users.
      */
     public function getAll(): array
     {
-        return $this->find("deleted_date IS NULL AND role != 'group'", ["order" => "name ASC"]);
+        return $this->find(
+            "deleted_date IS NULL AND role != 'group'",
+            ['order' => 'name ASC']
+        );
     }
 
     /**
-     * Load all deleted users
+     * Load all deleted users.
      */
     public function getAllDeleted(): array
     {
-        return $this->find("deleted_date IS NOT NULL AND role != 'group'", ["order" => "name ASC"]);
+        return $this->find(
+            "deleted_date IS NOT NULL AND role != 'group'",
+            ['order' => 'name ASC']
+        );
     }
 
     /**
-     * Load all active groups
+     * Load all active groups.
      */
     public function getAllGroups(): array
     {
-        return $this->find("deleted_date IS NULL AND role = 'group'", ["order" => "name ASC"]);
+        return $this->find(
+            "deleted_date IS NULL AND role = 'group'",
+            ['order' => 'name ASC']
+        );
     }
 
     /**
-     * Get all users within a group
-     * @return array|NULL
+     * Get all users within a group.
+     *
+     * @return array|null
      */
-    public function getGroupUsers()
+    public function getGroupUsers(): ?array
     {
-        if ($this->role == "group") {
-            if ($this->_groupUsers !== null) {
-                return $this->_groupUsers;
-            }
-
-            $ug = new User\Group();
-            /** @var User\Group[] $users */
-            $users = $ug->find(["group_id = ?", $this->id]);
-            $userIds = [];
-            foreach ($users as $user) {
-                $userIds[] = $user->user_id;
-            }
-
-            return $this->_groupUsers = $userIds !== [] ? $this->find("id IN (" . implode(",", $userIds) . ") AND deleted_date IS NULL") : [];
+        if ($this->role !== 'group') {
+            return null;
         }
 
-        return null;
-    }
-
-    /**
-     * Get array of IDs of users within a group
-     * @return array|NULL
-     */
-    public function getGroupUserIds()
-    {
-        if ($this->role == "group") {
-            if ($this->_groupUsers === null) {
-                $this->getGroupUsers();
-            }
-
-            $ids = [];
-            foreach ($this->_groupUsers as $u) {
-                $ids[] = $u->id;
-            }
-
-            return $ids;
+        if ($this->_groupUsers !== null) {
+            return $this->_groupUsers;
         }
 
-        return null;
+        $groupUserModel = new User\Group();
+
+        /** @var User\Group[] $users */
+        $users = $groupUserModel->find([
+            'group_id = ?',
+            $this->id,
+        ]);
+
+        if (!$users) {
+            return $this->_groupUsers = [];
+        }
+
+        $userIds = [];
+
+        foreach ($users as $user) {
+            $userId = (int) $user->user_id;
+
+            if ($userId > 0) {
+                $userIds[] = $userId;
+            }
+        }
+
+        $userIds = array_values(array_unique($userIds));
+
+        if ($userIds === []) {
+            return $this->_groupUsers = [];
+        }
+
+        $placeholders = implode(
+            ',',
+            array_fill(0, count($userIds), '?')
+        );
+
+        return $this->_groupUsers = $this->find([
+            "id IN ({$placeholders}) AND deleted_date IS NULL",
+            ...$userIds,
+        ]);
     }
 
     /**
-     * Get all user IDs in a group with a user, and all group IDs the user is in
+     * Get array of IDs of users within a group.
+     *
+     * @return array|null
+     */
+    public function getGroupUserIds(): ?array
+    {
+        $groupUsers = $this->getGroupUsers();
+
+        if ($groupUsers === null) {
+            return null;
+        }
+
+        $ids = [];
+
+        foreach ($groupUsers as $user) {
+            $userId = (int) $user->id;
+
+            if ($userId > 0) {
+                $ids[] = $userId;
+            }
+        }
+
+        return array_values(array_unique($ids));
+    }
+
+    /**
+     * Get all user IDs in groups shared with this user,
+     * together with all group IDs the user belongs to.
      */
     public function getSharedGroupUserIds(): array
     {
-        $groupModel = new \Model\User\Group();
-        $groups = $groupModel->find(["user_id = ?", $this->id]);
-        $groupIds = [];
-        foreach ($groups as $g) {
-            $groupIds[] = $g["group_id"];
+        if (!$this->id) {
+            return [];
         }
 
-        $ids = $groupIds;
-        if ($groupIds !== []) {
-            $groupIdString = implode(",", $groupIds);
-            $users = $groupModel->find("group_id IN ({$groupIdString})");
-            foreach ($users as $u) {
-                $ids[] = $u->user_id;
+        $groupModel = new User\Group();
+
+        $groups = $groupModel->find([
+            'user_id = ?',
+            $this->id,
+        ]);
+
+        $groupIds = [];
+
+        foreach ($groups as $group) {
+            $groupId = (int) $group->group_id;
+
+            if ($groupId > 0) {
+                $groupIds[] = $groupId;
             }
         }
 
-        if ($ids === []) {
+        $groupIds = array_values(array_unique($groupIds));
+
+        if ($groupIds === []) {
             return [$this->id];
         }
 
-        return $ids;
+        $ids = $groupIds;
+
+        $placeholders = implode(
+            ',',
+            array_fill(0, count($groupIds), '?')
+        );
+
+        $users = $groupModel->find([
+            "group_id IN ({$placeholders})",
+            ...$groupIds,
+        ]);
+
+        foreach ($users as $user) {
+            $userId = (int) $user->user_id;
+
+            if ($userId > 0) {
+                $ids[] = $userId;
+            }
+        }
+
+        $ids[] = (int) $this->id;
+
+        return array_values(array_unique($ids));
     }
 
     /**
-     * Get all user options
+     * Get all user options.
      */
     public function options(): array
     {
-        return $this->options ? json_decode($this->options, true, 512, JSON_THROW_ON_ERROR) : [];
+        if (!$this->options) {
+            return [];
+        }
+
+        try {
+            $options = json_decode(
+                $this->options,
+                true,
+                512,
+                JSON_THROW_ON_ERROR
+            );
+
+            return is_array($options) ? $options : [];
+        } catch (\JsonException $exception) {
+            return [];
+        }
     }
 
     /**
-     * Get or set a user option
-     * @param  mixed  $value
+     * Get or set a user option.
+     *
+     * @param mixed $value
+     *
      * @return mixed
      */
     public function option(string $key, $value = null)
     {
+        $key = trim($key);
+
+        if ($key === '') {
+            return $value === null ? null : $this;
+        }
+
         $options = $this->options();
+
         if ($value === null) {
             return $options[$key] ?? null;
         }
 
         $options[$key] = $value;
-        $this->options = json_encode($options, JSON_THROW_ON_ERROR);
+
+        $this->options = json_encode(
+            $options,
+            JSON_THROW_ON_ERROR
+        );
+
         return $this;
     }
 
     /**
-     * Send an email alert with issues due on the given date
+     * Send an email alert with issues due on the given date.
      */
     public function sendDueAlert(string $date = ''): bool
     {
@@ -215,127 +343,225 @@ class User extends \Model
         }
 
         if ($date === '' || $date === '0') {
-            $date = date("Y-m-d", \Helper\View::instance()->utc2local());
+            $date = date(
+                'Y-m-d',
+                \Helper\View::instance()->utc2local()
+            );
         }
 
-        // Get group owner IDs
-        $ownerIds = [$this->id];
-        $groups = new \Model\User\Group();
-        foreach ($groups->find(["user_id = ?", $this->id]) as $r) {
-            $ownerIds[] = $r->group_id;
+        $ownerIds = [(int) $this->id];
+
+        $groups = new User\Group();
+
+        foreach ($groups->find(['user_id = ?', $this->id]) as $group) {
+            $groupId = (int) $group->group_id;
+
+            if ($groupId > 0) {
+                $ownerIds[] = $groupId;
+            }
         }
 
-        $ownerStr = implode(",", $ownerIds);
+        $ownerIds = array_values(array_unique($ownerIds));
 
-        // Find issues assigned to user or user's group
+        $placeholders = implode(
+            ',',
+            array_fill(0, count($ownerIds), '?')
+        );
+
+        $parameters = array_merge([$date], $ownerIds);
+
         $issue = new Issue();
-        $due = $issue->find(["due_date = ? AND owner_id IN({$ownerStr}) AND closed_date IS NULL AND deleted_date IS NULL", $date], ["order" => "priority DESC"]);
-        $overdue = $issue->find(["due_date < ? AND owner_id IN({$ownerStr}) AND closed_date IS NULL AND deleted_date IS NULL", $date], ["order" => "priority DESC"]);
 
-        if ($due || $overdue) {
-            $notif = new \Helper\Notification();
-            return $notif->user_due_issues($this, $due, $overdue);
+        $due = $issue->find(
+            [
+                "due_date = ? AND owner_id IN ({$placeholders})
+                AND closed_date IS NULL
+                AND deleted_date IS NULL",
+                ...$parameters,
+            ],
+            ['order' => 'priority DESC']
+        );
+
+        $overdue = $issue->find(
+            [
+                "due_date < ? AND owner_id IN ({$placeholders})
+                AND closed_date IS NULL
+                AND deleted_date IS NULL",
+                ...$parameters,
+            ],
+            ['order' => 'priority DESC']
+        );
+
+        if (!$due && !$overdue) {
+            return false;
         }
 
-        return false;
+        $notification = new \Helper\Notification();
+
+        return $notification->user_due_issues(
+            $this,
+            $due,
+            $overdue
+        );
     }
 
     /**
-     * Get user statistics
-     * @param  int $time  The lower limit on timestamps for stats collection
+     * Get user statistics.
+     *
+     * @param int $time Lower timestamp limit.
      */
     public function stats(int $time = 0): array
     {
         $offset = \Helper\View::instance()->timeoffset();
 
-        if ($time === 0) {
-            $time = strtotime("-2 weeks", time() + $offset);
+        if ($time <= 0) {
+            $time = strtotime(
+                '-2 weeks',
+                time() + $offset
+            );
         }
 
-        $result = [];
-        $date_expr = ["DATE(DATE_ADD(", ", INTERVAL :offset SECOND))"];
-        if (\Base::instance()->get("db.engine") == "sqlite") {
-            $date_expr = ["DATE(", ", :offset || ' seconds')"];
-        }
-
-        $result["spent"] = $this->db->exec(
-            "SELECT {$date_expr[0]}u.created_date{$date_expr[1]} AS `date`, SUM(f.new_value - f.old_value) AS `val`
-            FROM issue_update u
-            JOIN issue_update_field f ON u.id = f.issue_update_id AND f.field = 'hours_spent'
-            WHERE u.user_id = :user AND u.created_date > :date
-            GROUP BY `date`",
-            [":user" => $this->id, ":offset" => $offset, ":date" => date("Y-m-d H:i:s", $time)]
-        );
-        $result["closed"] = $this->db->exec(
-            "SELECT {$date_expr[0]}i.closed_date{$date_expr[1]} AS `date`, COUNT(*) AS `val`
-            FROM issue i
-            WHERE i.owner_id = :user AND i.closed_date > :date
-            GROUP BY `date`",
-            [":user" => $this->id, ":offset" => $offset, ":date" => date("Y-m-d H:i:s", $time)]
-        );
-        $result["created"] = $this->db->exec(
-            "SELECT {$date_expr[0]}i.created_date{$date_expr[1]} AS `date`, COUNT(*) AS `val`
-            FROM issue i
-            WHERE i.author_id = :user AND i.created_date > :date
-            GROUP BY `date`",
-            [":user" => $this->id, ":offset" => $offset, ":date" => date("Y-m-d H:i:s", $time)]
-        );
-
-        $dates = $this->_createDateRangeArray(date("Y-m-d", $time), date("Y-m-d", time() + $offset));
-        $return = [
-            "labels" => [],
-            "spent" => [],
-            "closed" => [],
-            "created" => [],
+        $dateExpression = [
+            'DATE(DATE_ADD(',
+            ', INTERVAL :offset SECOND))',
         ];
 
-        foreach ($result["spent"] as $r) {
-            $return["spent"][$r["date"]] = floatval($r["val"]);
+        if (\Base::instance()->get('db.engine') === 'sqlite') {
+            $dateExpression = [
+                'DATE(',
+                ", :offset || ' seconds')",
+            ];
         }
 
-        foreach ($result["closed"] as $r) {
-            $return["closed"][$r["date"]] = intval($r["val"]);
+        $dateStart = date('Y-m-d H:i:s', $time);
+
+        $result = [];
+
+        $result['spent'] = $this->db->exec(
+            "SELECT
+                {$dateExpression[0]}u.created_date{$dateExpression[1]} AS `date`,
+                SUM(f.new_value - f.old_value) AS `val`
+            FROM issue_update u
+            JOIN issue_update_field f
+                ON u.id = f.issue_update_id
+                AND f.field = 'hours_spent'
+            WHERE
+                u.user_id = :user
+                AND u.created_date > :date
+            GROUP BY `date`",
+            [
+                ':user' => $this->id,
+                ':offset' => $offset,
+                ':date' => $dateStart,
+            ]
+        );
+
+        $result['closed'] = $this->db->exec(
+            "SELECT
+                {$dateExpression[0]}i.closed_date{$dateExpression[1]} AS `date`,
+                COUNT(*) AS `val`
+            FROM issue i
+            WHERE
+                i.owner_id = :user
+                AND i.closed_date > :date
+            GROUP BY `date`",
+            [
+                ':user' => $this->id,
+                ':offset' => $offset,
+                ':date' => $dateStart,
+            ]
+        );
+
+        $result['created'] = $this->db->exec(
+            "SELECT
+                {$dateExpression[0]}i.created_date{$dateExpression[1]} AS `date`,
+                COUNT(*) AS `val`
+            FROM issue i
+            WHERE
+                i.author_id = :user
+                AND i.created_date > :date
+            GROUP BY `date`",
+            [
+                ':user' => $this->id,
+                ':offset' => $offset,
+                ':date' => $dateStart,
+            ]
+        );
+
+        $dates = $this->_createDateRangeArray(
+            date('Y-m-d', $time),
+            date('Y-m-d', time() + $offset)
+        );
+
+        $return = [
+            'labels' => [],
+            'spent' => [],
+            'closed' => [],
+            'created' => [],
+        ];
+
+        foreach ($result['spent'] as $row) {
+            $return['spent'][$row['date']] = (float) $row['val'];
         }
 
-        foreach ($result["created"] as $r) {
-            $return["created"][$r["date"]] = intval($r["val"]);
+        foreach ($result['closed'] as $row) {
+            $return['closed'][$row['date']] = (int) $row['val'];
+        }
+
+        foreach ($result['created'] as $row) {
+            $return['created'][$row['date']] = (int) $row['val'];
         }
 
         foreach ($dates as $date) {
-            $return["labels"][$date] = date("D j", strtotime((string) $date));
-            if (!isset($return["spent"][$date])) {
-                $return["spent"][$date] = 0;
-            }
+            $date = (string) $date;
 
-            if (!isset($return["closed"][$date])) {
-                $return["closed"][$date] = 0;
-            }
+            $return['labels'][$date] = date(
+                'D j',
+                strtotime($date)
+            );
 
-            if (!isset($return["created"][$date])) {
-                $return["created"][$date] = 0;
-            }
+            $return['spent'][$date] ??= 0;
+            $return['closed'][$date] ??= 0;
+            $return['created'][$date] ??= 0;
         }
 
-        foreach ($return as &$r) {
-            ksort($r);
+        foreach ($return as &$values) {
+            ksort($values);
         }
+
+        unset($values);
 
         return $return;
     }
 
     /**
-     * Reassign open assigned issues
-     * @return int Number of issues affected
-     * @throws \Exception
+     * Reassign open assigned issues.
+     *
+     * @return int Number of issues affected.
+     *
+     * @throws \RuntimeException
      */
     public function reassignIssues(?int $userId): int
     {
         if (!$this->id) {
-            throw new \Exception("User is not initialized.");
+            throw new \RuntimeException(
+                'User is not initialized.'
+            );
+        }
+
+        if ($userId !== null && $userId <= 0) {
+            throw new \InvalidArgumentException(
+                'Invalid target user identifier.'
+            );
         }
 
         $issueModel = new Issue();
-        $issues = $issueModel->find(["owner_id = ? AND deleted_date IS NULL AND closed_date IS NULL", $this->id]);
+
+        $issues = $issueModel->find([
+            'owner_id = ? AND deleted_date IS NULL AND closed_date IS NULL',
+            $this->id,
+        ]);
+
         foreach ($issues as $issue) {
             $issue->owner_id = $userId;
             $issue->save();
@@ -344,32 +570,104 @@ class User extends \Model
         return count($issues);
     }
 
-    public function date_picker()
+    /**
+     * Get date-picker language configuration.
+     */
+    public function date_picker(): object
     {
-        $lang = $this->language ?: \Base::instance()->get("LANGUAGE");
-        $lang = explode(',', (string) $lang, 2)[0];
-        return (object)["language" => $lang, "js" => ($lang !== "en")];
+        $language = $this->language
+            ?: \Base::instance()->get('LANGUAGE');
+
+        $language = explode(
+            ',',
+            (string) $language,
+            2
+        )[0];
+
+        $language = trim($language);
+
+        if ($language === '') {
+            $language = 'en';
+        }
+
+        return (object) [
+            'language' => $language,
+            'js' => $language !== 'en',
+        ];
     }
 
     /**
-     * Generate a password reset token and store hashed value
+     * Generate a password reset token and store its hashed value.
      */
     public function generateResetToken(): string
     {
-        $random = random_bytes(512);
-        $token = hash("sha384", $random) . time();
-        $this->reset_token = hash("sha384", $token);
+        $random = random_bytes(64);
+
+        $token = hash('sha384', $random)
+            . (string) time();
+
+        $this->reset_token = hash(
+            'sha384',
+            $token
+        );
+
         return $token;
     }
 
     /**
-     * Validate a plaintext password reset token
+     * Validate a plaintext password reset token.
      */
     public function validateResetToken(string $token): bool
     {
-        $ttl = \Base::instance()->get("security.reset_ttl");
-        $timestampValid = substr($token, 96) > (time() - $ttl);
-        $tokenValid = hash_equals($this->reset_token ?? '', hash("sha384", $token));
-        return $timestampValid && $tokenValid;
+        $token = trim($token);
+
+        if (
+            $token === ''
+            || strlen($token) <= self::RESET_TOKEN_HASH_LENGTH
+            || empty($this->reset_token)
+        ) {
+            return false;
+        }
+
+        $ttl = (int) \Base::instance()->get(
+            'security.reset_ttl'
+        );
+
+        if ($ttl <= 0) {
+            return false;
+        }
+
+        $timestamp = substr(
+            $token,
+            self::RESET_TOKEN_HASH_LENGTH
+        );
+
+        if (
+            $timestamp === ''
+            || !ctype_digit($timestamp)
+        ) {
+            return false;
+        }
+
+        $timestamp = (int) $timestamp;
+        $currentTime = time();
+
+        $timestampValid =
+            $timestamp <= $currentTime
+            && $timestamp >= ($currentTime - $ttl);
+
+        if (!$timestampValid) {
+            return false;
+        }
+
+        $providedHash = hash(
+            'sha384',
+            $token
+        );
+
+        return hash_equals(
+            (string) $this->reset_token,
+            $providedHash
+        );
     }
 }
