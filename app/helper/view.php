@@ -54,7 +54,13 @@ class View extends \Template
         $cache = \Cache::instance();
         $hash = null;
         if ($ttl !== null) {
-            $hash = sha1($str . json_encode($options, JSON_THROW_ON_ERROR));
+            $hash = hash(
+    'sha256',
+    $str . json_encode(
+        $options,
+        JSON_THROW_ON_ERROR
+    )
+);
 
             // Return value if cached
             if (($str = $cache->get("{$hash}.tex")) !== false) {
@@ -80,7 +86,7 @@ class View extends \Template
                 // Yes, this is hacky. Please open an issue on GitHub if you
                 // know of a better way of supporting Markdown and Textile :)
                 $str = html_entity_decode((string) $str);
-                $str = preg_replace('/^<p>|<\/p>$/m', "\n", $str);
+                $str = preg_replace('/(?:^<p>|<\/p>$)/m', "\n", $str);
                 $escape = false;
             }
 
