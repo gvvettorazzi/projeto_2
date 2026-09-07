@@ -33,14 +33,19 @@ class User extends \Model
     public const RANK_ADMIN = 4;
     public const RANK_SUPER = 5;
 
+    private const RESET_TOKEN_HASH_ALGORITHM = 'sha384';
     private const RESET_TOKEN_HASH_LENGTH = 96;
+    private const RESET_RANDOM_BYTES = 64;
+
+    private const MIN_AVATAR_SIZE = 1;
+    private const MAX_AVATAR_SIZE = 2048;
 
     protected $_table_name = 'user';
 
     protected $_groupUsers = null;
 
     /**
-     * Load currently logged-in user, if any.
+     * Load currently authenticated user.
      */
     public function loadCurrent(): static
     {
@@ -49,9 +54,17 @@ class User extends \Model
         $session = new Session();
         $session->loadCurrent();
 
-        $userId = (int) ($session->user_id ?? 0);
+        $userId = filter_var(
+            $session->user_id ?? null,
+            FILTER_VALIDATE_INT,
+            [
+                'options' => [
+                    'min_range' => 1,
+                ],
+            ]
+        );
 
-        if ($userId <= 0) {
+        if ($userId === false) {
             return $this;
         }
 
@@ -67,8 +80,11 @@ class User extends \Model
         $f3->set('user', $this->cast());
         $f3->set('user_obj', $this);
 
-        if ($this->exists('language') && !empty($this->language)) {
-            $f3->set('LANGUAGE', $this->language);
+        if ($this->exists('language') && $this->language) {
+            $f3->set(
+                'LANGUAGE',
+                $this->sanitizeLanguage((string) $this->language)
+            );
         }
 
         return $this;
@@ -85,25 +101,38 @@ class User extends \Model
             return false;
         }
 
-        $size = max(1, $size);
+        $size = max(
+            self::MIN_AVATAR_SIZE,
+            min(self::MAX_AVATAR_SIZE, $size)
+        );
 
-        $avatarFilename = (string) $this->get('avatar_filename');
+        $avatarFilename = $this->sanitizeFilename(
+            (string) $this->get('avatar_filename')
+        );
 
         if ($avatarFilename !== '') {
-            $avatarPath = 'uploads/avatars/' . basename($avatarFilename);
+            $avatarPath = sprintf(
+                'uploads/avatars/%s',
+                $avatarFilename
+            );
 
             if (is_file($avatarPath)) {
                 return sprintf(
                     '%s/avatar/%d-%d.png',
-                    \Base::instance()->get('BASE'),
+                    rtrim((string) \Base::instance()->get('BASE'), '/'),
                     $size,
-                    $this->id
+                    (int) $this->id
                 );
             }
         }
 
-        return \Helper\View::instance()->gravatar(
+        $email = filter_var(
             (string) $this->get('email'),
+            FILTER_VALIDATE_EMAIL
+        );
+
+        return \Helper\View::instance()->gravatar(
+            $email !== false ? $email : '',
             $size
         );
     }
@@ -115,8 +144,10 @@ class User extends \Model
     {
         return $this->find(
             "deleted_date IS NULL AND role != 'group'",
-            ['order' => 'name ASC']
-        );
+            [
+                'order' => 'name ASC',
+            ]
+        ) ?: [];
     }
 
     /**
@@ -126,8 +157,10 @@ class User extends \Model
     {
         return $this->find(
             "deleted_date IS NOT NULL AND role != 'group'",
-            ['order' => 'name ASC']
-        );
+            [
+                'order' => 'name ASC',
+            ]
+        ) ?: [];
     }
 
     /**
@@ -137,8 +170,10 @@ class User extends \Model
     {
         return $this->find(
             "deleted_date IS NULL AND role = 'group'",
-            ['order' => 'name ASC']
-        );
+            [
+                'order' => 'name ASC',
+            ]
+        ) ?: [];
     }
 
     /**
@@ -156,24 +191,27 @@ class User extends \Model
             return $this->_groupUsers;
         }
 
-        $groupUserModel = new User\Group();
+        $groupId = $this->validatePositiveId($this->id);
 
-        /** @var User\Group[] $users */
-        $users = $groupUserModel->find([
-            'group_id = ?',
-            $this->id,
-        ]);
-
-        if (!$users) {
+        if ($groupId === null) {
             return $this->_groupUsers = [];
         }
 
+        $groupModel = new User\Group();
+
+        $groupUsers = $groupModel->find([
+            'group_id = ?',
+            $groupId,
+        ]) ?: [];
+
         $userIds = [];
 
-        foreach ($users as $user) {
-            $userId = (int) $user->user_id;
+        foreach ($groupUsers as $groupUser) {
+            $userId = $this->validatePositiveId(
+                $groupUser->user_id ?? null
+            );
 
-            if ($userId > 0) {
+            if ($userId !== null) {
                 $userIds[] = $userId;
             }
         }
@@ -189,31 +227,35 @@ class User extends \Model
             array_fill(0, count($userIds), '?')
         );
 
-        return $this->_groupUsers = $this->find([
+        $result = $this->find([
             "id IN ({$placeholders}) AND deleted_date IS NULL",
             ...$userIds,
         ]);
+
+        return $this->_groupUsers = $result ?: [];
     }
 
     /**
-     * Get array of IDs of users within a group.
+     * Get IDs of users within a group.
      *
      * @return array|null
      */
     public function getGroupUserIds(): ?array
     {
-        $groupUsers = $this->getGroupUsers();
+        $users = $this->getGroupUsers();
 
-        if ($groupUsers === null) {
+        if ($users === null) {
             return null;
         }
 
         $ids = [];
 
-        foreach ($groupUsers as $user) {
-            $userId = (int) $user->id;
+        foreach ($users as $user) {
+            $userId = $this->validatePositiveId(
+                $user->id ?? null
+            );
 
-            if ($userId > 0) {
+            if ($userId !== null) {
                 $ids[] = $userId;
             }
         }
@@ -222,12 +264,13 @@ class User extends \Model
     }
 
     /**
-     * Get all user IDs in groups shared with this user,
-     * together with all group IDs the user belongs to.
+     * Get all user and group IDs shared with the current user.
      */
     public function getSharedGroupUserIds(): array
     {
-        if (!$this->id) {
+        $currentUserId = $this->validatePositiveId($this->id);
+
+        if ($currentUserId === null) {
             return [];
         }
 
@@ -235,15 +278,17 @@ class User extends \Model
 
         $groups = $groupModel->find([
             'user_id = ?',
-            $this->id,
-        ]);
+            $currentUserId,
+        ]) ?: [];
 
         $groupIds = [];
 
         foreach ($groups as $group) {
-            $groupId = (int) $group->group_id;
+            $groupId = $this->validatePositiveId(
+                $group->group_id ?? null
+            );
 
-            if ($groupId > 0) {
+            if ($groupId !== null) {
                 $groupIds[] = $groupId;
             }
         }
@@ -251,30 +296,31 @@ class User extends \Model
         $groupIds = array_values(array_unique($groupIds));
 
         if ($groupIds === []) {
-            return [$this->id];
+            return [$currentUserId];
         }
-
-        $ids = $groupIds;
 
         $placeholders = implode(
             ',',
             array_fill(0, count($groupIds), '?')
         );
 
-        $users = $groupModel->find([
+        $memberships = $groupModel->find([
             "group_id IN ({$placeholders})",
             ...$groupIds,
-        ]);
+        ]) ?: [];
 
-        foreach ($users as $user) {
-            $userId = (int) $user->user_id;
+        $ids = $groupIds;
+        $ids[] = $currentUserId;
 
-            if ($userId > 0) {
+        foreach ($memberships as $membership) {
+            $userId = $this->validatePositiveId(
+                $membership->user_id ?? null
+            );
+
+            if ($userId !== null) {
                 $ids[] = $userId;
             }
         }
-
-        $ids[] = (int) $this->id;
 
         return array_values(array_unique($ids));
     }
@@ -284,19 +330,24 @@ class User extends \Model
      */
     public function options(): array
     {
-        if (!$this->options) {
+        if (
+            $this->options === null
+            || trim((string) $this->options) === ''
+        ) {
             return [];
         }
 
         try {
-            $options = json_decode(
-                $this->options,
+            $decoded = json_decode(
+                (string) $this->options,
                 true,
                 512,
                 JSON_THROW_ON_ERROR
             );
 
-            return is_array($options) ? $options : [];
+            return is_array($decoded)
+                ? $decoded
+                : [];
         } catch (\JsonException $exception) {
             return [];
         }
@@ -311,10 +362,12 @@ class User extends \Model
      */
     public function option(string $key, $value = null)
     {
-        $key = trim($key);
+        $key = $this->sanitizeOptionKey($key);
 
         if ($key === '') {
-            return $value === null ? null : $this;
+            return $value === null
+                ? null
+                : $this;
         }
 
         $options = $this->options();
@@ -323,12 +376,20 @@ class User extends \Model
             return $options[$key] ?? null;
         }
 
-        $options[$key] = $value;
+        $options[$key] = $this->sanitizeOptionValue($value);
 
-        $this->options = json_encode(
-            $options,
-            JSON_THROW_ON_ERROR
-        );
+        try {
+            $this->options = json_encode(
+                $options,
+                JSON_THROW_ON_ERROR
+            );
+        } catch (\JsonException $exception) {
+            throw new \InvalidArgumentException(
+                'Unable to encode user options.',
+                0,
+                $exception
+            );
+        }
 
         return $this;
     }
@@ -338,7 +399,9 @@ class User extends \Model
      */
     public function sendDueAlert(string $date = ''): bool
     {
-        if (!$this->id) {
+        $userId = $this->validatePositiveId($this->id);
+
+        if ($userId === null) {
             return false;
         }
 
@@ -349,56 +412,80 @@ class User extends \Model
             );
         }
 
-        $ownerIds = [(int) $this->id];
+        if (!$this->isValidDate($date)) {
+            return false;
+        }
 
-        $groups = new User\Group();
+        $ownerIds = [$userId];
 
-        foreach ($groups->find(['user_id = ?', $this->id]) as $group) {
-            $groupId = (int) $group->group_id;
+        $groupModel = new User\Group();
 
-            if ($groupId > 0) {
+        $groups = $groupModel->find([
+            'user_id = ?',
+            $userId,
+        ]) ?: [];
+
+        foreach ($groups as $group) {
+            $groupId = $this->validatePositiveId(
+                $group->group_id ?? null
+            );
+
+            if ($groupId !== null) {
                 $ownerIds[] = $groupId;
             }
         }
 
         $ownerIds = array_values(array_unique($ownerIds));
 
+        if ($ownerIds === []) {
+            return false;
+        }
+
         $placeholders = implode(
             ',',
             array_fill(0, count($ownerIds), '?')
         );
 
-        $parameters = array_merge([$date], $ownerIds);
+        $parameters = array_merge(
+            [$date],
+            $ownerIds
+        );
 
-        $issue = new Issue();
+        $issueModel = new Issue();
 
-        $due = $issue->find(
+        $due = $issueModel->find(
             [
-                "due_date = ? AND owner_id IN ({$placeholders})
+                "due_date = ?
+                AND owner_id IN ({$placeholders})
                 AND closed_date IS NULL
                 AND deleted_date IS NULL",
                 ...$parameters,
             ],
-            ['order' => 'priority DESC']
-        );
-
-        $overdue = $issue->find(
             [
-                "due_date < ? AND owner_id IN ({$placeholders})
+                'order' => 'priority DESC',
+            ]
+        ) ?: [];
+
+        $overdue = $issueModel->find(
+            [
+                "due_date < ?
+                AND owner_id IN ({$placeholders})
                 AND closed_date IS NULL
                 AND deleted_date IS NULL",
                 ...$parameters,
             ],
-            ['order' => 'priority DESC']
-        );
+            [
+                'order' => 'priority DESC',
+            ]
+        ) ?: [];
 
-        if (!$due && !$overdue) {
+        if ($due === [] && $overdue === []) {
             return false;
         }
 
         $notification = new \Helper\Notification();
 
-        return $notification->user_due_issues(
+        return (bool) $notification->user_due_issues(
             $this,
             $due,
             $overdue
@@ -412,13 +499,28 @@ class User extends \Model
      */
     public function stats(int $time = 0): array
     {
-        $offset = \Helper\View::instance()->timeoffset();
+        $userId = $this->validatePositiveId($this->id);
+
+        if ($userId === null) {
+            return [
+                'labels' => [],
+                'spent' => [],
+                'closed' => [],
+                'created' => [],
+            ];
+        }
+
+        $offset = (int) \Helper\View::instance()->timeoffset();
 
         if ($time <= 0) {
             $time = strtotime(
                 '-2 weeks',
                 time() + $offset
             );
+
+            if ($time === false) {
+                $time = time() - 1209600;
+            }
         }
 
         $dateExpression = [
@@ -433,11 +535,15 @@ class User extends \Model
             ];
         }
 
-        $dateStart = date('Y-m-d H:i:s', $time);
+        $date = date('Y-m-d H:i:s', $time);
 
-        $result = [];
+        $parameters = [
+            ':user' => $userId,
+            ':offset' => $offset,
+            ':date' => $date,
+        ];
 
-        $result['spent'] = $this->db->exec(
+        $spent = $this->db->exec(
             "SELECT
                 {$dateExpression[0]}u.created_date{$dateExpression[1]} AS `date`,
                 SUM(f.new_value - f.old_value) AS `val`
@@ -449,14 +555,10 @@ class User extends \Model
                 u.user_id = :user
                 AND u.created_date > :date
             GROUP BY `date`",
-            [
-                ':user' => $this->id,
-                ':offset' => $offset,
-                ':date' => $dateStart,
-            ]
-        );
+            $parameters
+        ) ?: [];
 
-        $result['closed'] = $this->db->exec(
+        $closed = $this->db->exec(
             "SELECT
                 {$dateExpression[0]}i.closed_date{$dateExpression[1]} AS `date`,
                 COUNT(*) AS `val`
@@ -465,14 +567,10 @@ class User extends \Model
                 i.owner_id = :user
                 AND i.closed_date > :date
             GROUP BY `date`",
-            [
-                ':user' => $this->id,
-                ':offset' => $offset,
-                ':date' => $dateStart,
-            ]
-        );
+            $parameters
+        ) ?: [];
 
-        $result['created'] = $this->db->exec(
+        $created = $this->db->exec(
             "SELECT
                 {$dateExpression[0]}i.created_date{$dateExpression[1]} AS `date`,
                 COUNT(*) AS `val`
@@ -481,75 +579,98 @@ class User extends \Model
                 i.author_id = :user
                 AND i.created_date > :date
             GROUP BY `date`",
-            [
-                ':user' => $this->id,
-                ':offset' => $offset,
-                ':date' => $dateStart,
-            ]
-        );
+            $parameters
+        ) ?: [];
 
         $dates = $this->_createDateRangeArray(
             date('Y-m-d', $time),
             date('Y-m-d', time() + $offset)
         );
 
-        $return = [
+        $result = [
             'labels' => [],
             'spent' => [],
             'closed' => [],
             'created' => [],
         ];
 
-        foreach ($result['spent'] as $row) {
-            $return['spent'][$row['date']] = (float) $row['val'];
+        foreach ($spent as $row) {
+            if (!isset($row['date'], $row['val'])) {
+                continue;
+            }
+
+            $result['spent'][(string) $row['date']] =
+                (float) $row['val'];
         }
 
-        foreach ($result['closed'] as $row) {
-            $return['closed'][$row['date']] = (int) $row['val'];
+        foreach ($closed as $row) {
+            if (!isset($row['date'], $row['val'])) {
+                continue;
+            }
+
+            $result['closed'][(string) $row['date']] =
+                (int) $row['val'];
         }
 
-        foreach ($result['created'] as $row) {
-            $return['created'][$row['date']] = (int) $row['val'];
+        foreach ($created as $row) {
+            if (!isset($row['date'], $row['val'])) {
+                continue;
+            }
+
+            $result['created'][(string) $row['date']] =
+                (int) $row['val'];
         }
 
-        foreach ($dates as $date) {
-            $date = (string) $date;
+        foreach ($dates as $dateValue) {
+            $dateValue = (string) $dateValue;
 
-            $return['labels'][$date] = date(
-                'D j',
-                strtotime($date)
-            );
+            if (!$this->isValidDate($dateValue)) {
+                continue;
+            }
 
-            $return['spent'][$date] ??= 0;
-            $return['closed'][$date] ??= 0;
-            $return['created'][$date] ??= 0;
+            $timestamp = strtotime($dateValue);
+
+            if ($timestamp === false) {
+                continue;
+            }
+
+            $result['labels'][$dateValue] =
+                date('D j', $timestamp);
+
+            $result['spent'][$dateValue] ??= 0.0;
+            $result['closed'][$dateValue] ??= 0;
+            $result['created'][$dateValue] ??= 0;
         }
 
-        foreach ($return as &$values) {
+        foreach ($result as &$values) {
             ksort($values);
         }
 
         unset($values);
 
-        return $return;
+        return $result;
     }
 
     /**
-     * Reassign open assigned issues.
-     *
-     * @return int Number of issues affected.
+     * Reassign open issues.
      *
      * @throws \RuntimeException
+     * @throws \InvalidArgumentException
      */
     public function reassignIssues(?int $userId): int
     {
-        if (!$this->id) {
+        $currentUserId = $this->validatePositiveId($this->id);
+
+        if ($currentUserId === null) {
             throw new \RuntimeException(
                 'User is not initialized.'
             );
         }
 
-        if ($userId !== null && $userId <= 0) {
+        if (
+            $userId !== null
+            && $this->validatePositiveId($userId) === null
+        ) {
             throw new \InvalidArgumentException(
                 'Invalid target user identifier.'
             );
@@ -558,9 +679,11 @@ class User extends \Model
         $issueModel = new Issue();
 
         $issues = $issueModel->find([
-            'owner_id = ? AND deleted_date IS NULL AND closed_date IS NULL',
-            $this->id,
-        ]);
+            'owner_id = ?
+            AND deleted_date IS NULL
+            AND closed_date IS NULL',
+            $currentUserId,
+        ]) ?: [];
 
         foreach ($issues as $issue) {
             $issue->owner_id = $userId;
@@ -571,24 +694,16 @@ class User extends \Model
     }
 
     /**
-     * Get date-picker language configuration.
+     * Get date picker language.
      */
     public function date_picker(): object
     {
         $language = $this->language
             ?: \Base::instance()->get('LANGUAGE');
 
-        $language = explode(
-            ',',
-            (string) $language,
-            2
-        )[0];
-
-        $language = trim($language);
-
-        if ($language === '') {
-            $language = 'en';
-        }
+        $language = $this->sanitizeLanguage(
+            (string) $language
+        );
 
         return (object) [
             'language' => $language,
@@ -597,17 +712,19 @@ class User extends \Model
     }
 
     /**
-     * Generate a password reset token and store its hashed value.
+     * Generate a cryptographically secure password reset token.
      */
     public function generateResetToken(): string
     {
-        $random = random_bytes(64);
+        $random = random_bytes(self::RESET_RANDOM_BYTES);
 
-        $token = hash('sha384', $random)
-            . (string) time();
+        $token = hash(
+            self::RESET_TOKEN_HASH_ALGORITHM,
+            $random
+        ) . (string) time();
 
         $this->reset_token = hash(
-            'sha384',
+            self::RESET_TOKEN_HASH_ALGORITHM,
             $token
         );
 
@@ -629,45 +746,244 @@ class User extends \Model
             return false;
         }
 
-        $ttl = (int) \Base::instance()->get(
-            'security.reset_ttl'
-        );
-
-        if ($ttl <= 0) {
+        /*
+         * Tokens generated by generateResetToken() contain:
+         * 96 hexadecimal SHA-384 characters + Unix timestamp.
+         */
+        if (
+            !preg_match(
+                '/^[a-f0-9]{96}[0-9]+$/D',
+                $token
+            )
+        ) {
             return false;
         }
 
-        $timestamp = substr(
+        $ttl = filter_var(
+            \Base::instance()->get('security.reset_ttl'),
+            FILTER_VALIDATE_INT,
+            [
+                'options' => [
+                    'min_range' => 1,
+                ],
+            ]
+        );
+
+        if ($ttl === false) {
+            return false;
+        }
+
+        $timestampPart = substr(
             $token,
             self::RESET_TOKEN_HASH_LENGTH
         );
 
         if (
-            $timestamp === ''
-            || !ctype_digit($timestamp)
+            $timestampPart === ''
+            || !ctype_digit($timestampPart)
         ) {
             return false;
         }
 
-        $timestamp = (int) $timestamp;
+        $timestamp = (int) $timestampPart;
         $currentTime = time();
 
-        $timestampValid =
-            $timestamp <= $currentTime
-            && $timestamp >= ($currentTime - $ttl);
+        if (
+            $timestamp > $currentTime
+            || $timestamp < ($currentTime - $ttl)
+        ) {
+            return false;
+        }
 
-        if (!$timestampValid) {
+        $expectedHash = (string) $this->reset_token;
+
+        if (
+            strlen($expectedHash) !== self::RESET_TOKEN_HASH_LENGTH
+            || !ctype_xdigit($expectedHash)
+        ) {
             return false;
         }
 
         $providedHash = hash(
-            'sha384',
+            self::RESET_TOKEN_HASH_ALGORITHM,
             $token
         );
 
         return hash_equals(
-            (string) $this->reset_token,
+            strtolower($expectedHash),
             $providedHash
         );
+    }
+
+    /**
+     * Validate a positive numeric identifier.
+     */
+    private function validatePositiveId($value): ?int
+    {
+        $id = filter_var(
+            $value,
+            FILTER_VALIDATE_INT,
+            [
+                'options' => [
+                    'min_range' => 1,
+                ],
+            ]
+        );
+
+        return $id === false
+            ? null
+            : $id;
+    }
+
+    /**
+     * Sanitize a filename and prevent path traversal.
+     */
+    private function sanitizeFilename(string $filename): string
+    {
+        $filename = trim($filename);
+
+        if ($filename === '') {
+            return '';
+        }
+
+        $filename = basename($filename);
+
+        return preg_replace(
+            '/[^a-zA-Z0-9._-]/',
+            '',
+            $filename
+        ) ?? '';
+    }
+
+    /**
+     * Sanitize an option key.
+     */
+    private function sanitizeOptionKey(string $key): string
+    {
+        $key = trim($key);
+
+        if ($key === '') {
+            return '';
+        }
+
+        /*
+         * Option names are identifiers, therefore control
+         * characters and unexpected symbols are rejected.
+         */
+        $key = preg_replace(
+            '/[^a-zA-Z0-9_.-]/',
+            '',
+            $key
+        );
+
+        if ($key === null) {
+            return '';
+        }
+
+        return substr($key, 0, 128);
+    }
+
+    /**
+     * Sanitize values stored in user options.
+     *
+     * Scalar strings have null/control characters removed.
+     * Arrays are sanitized recursively.
+     *
+     * @param mixed $value
+     *
+     * @return mixed
+     */
+    private function sanitizeOptionValue($value)
+    {
+        if (is_string($value)) {
+            $value = preg_replace(
+                '/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/u',
+                '',
+                $value
+            );
+
+            return $value ?? '';
+        }
+
+        if (is_array($value)) {
+            $sanitized = [];
+
+            foreach ($value as $key => $item) {
+                $cleanKey = is_string($key)
+                    ? $this->sanitizeOptionKey($key)
+                    : $key;
+
+                if ($cleanKey === '') {
+                    continue;
+                }
+
+                $sanitized[$cleanKey] =
+                    $this->sanitizeOptionValue($item);
+            }
+
+            return $sanitized;
+        }
+
+        if (
+            $value === null
+            || is_bool($value)
+            || is_int($value)
+            || is_float($value)
+        ) {
+            return $value;
+        }
+
+        throw new \InvalidArgumentException(
+            'Unsupported option value type.'
+        );
+    }
+
+    /**
+     * Validate Y-m-d formatted date.
+     */
+    private function isValidDate(string $date): bool
+    {
+        if (
+            !preg_match(
+                '/^\d{4}-\d{2}-\d{2}$/D',
+                $date
+            )
+        ) {
+            return false;
+        }
+
+        $dateObject = \DateTimeImmutable::createFromFormat(
+            '!Y-m-d',
+            $date
+        );
+
+        return $dateObject !== false
+            && $dateObject->format('Y-m-d') === $date;
+    }
+
+    /**
+     * Sanitize language configuration.
+     */
+    private function sanitizeLanguage(string $language): string
+    {
+        $language = explode(
+            ',',
+            $language,
+            2
+        )[0];
+
+        $language = trim($language);
+
+        if (
+            $language === ''
+            || !preg_match(
+                '/^[a-zA-Z]{2,3}(?:[-_][a-zA-Z]{2,4})?$/D',
+                $language
+            )
+        ) {
+            return 'en';
+        }
+
+        return $language;
     }
 }
