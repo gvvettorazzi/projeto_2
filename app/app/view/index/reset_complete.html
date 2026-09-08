@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="{{ @this->lang() }}">
+<head>
+    <include href="blocks/head.html" />
+    <title>{{ empty(@title) ? @site.name : @title . ' - ' . @site.name | esc }}</title>
+</head>
+<body class="login">
+<div class="hidden-xs" style="padding-top: 160px;"></div>
+<div class="container-fluid">
+    <div class="row">
+        <div class="col-sm-4 col-sm-offset-4">
+            <form action="{{ @BASE }}/reset/{{ @PARAMS.token }}" method="post" class="form-horizontal">
+                <csrf-token />
+                <fieldset>
+                    <legend>{{ @dict.reset_password }}</legend>
+                    <check if="{{ !empty(@reset.success) }}">
+                        <p class="alert alert-success">{{ @reset.success | esc }}</p>
+                    </check>
+                    <check if="{{ !empty(@reset.error) }}">
+                        <p class="alert alert-danger">{{ @reset.error | esc }}</p>
+                    </check>
+                    <div class="form-group">
+                        <label for="reset-username" class="col-md-4 control-label">{{ @dict.username }}</label>
+                        <div class="col-md-8">
+                            <input class="form-control disabled" id="reset-username" value="{{ @resetuser.username | esc }}" disabled>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="reset-password1" class="col-md-4 control-label">{{ @dict.new_password }}</label>
+                        <div class="col-md-8">
+                            <input class="form-control" id="reset-password1" name="password1" type="password" maxlength="1024" autocomplete="new-password" required autofocus>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="reset-password2" class="col-md-4 control-label">{{ @dict.confirm_password }}</label>
+                        <div class="col-md-8">
+                            <input class="form-control" id="reset-password2" name="password2" type="password" maxlength="1024" autocomplete="new-password" required>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <div class="col-lg-8 col-lg-offset-4">
+                            <button type="submit" class="btn btn-primary">{{ @dict.reset_password }}</button>
+                            <a href="{{ @BASE }}/login" class="btn btn-link">{{ @dict.cancel }}</a>
+                        </div>
+                    </div>
+                </fieldset>
+            </form>
+        </div>
+    </div>
+</div>
+</body>
+</html>

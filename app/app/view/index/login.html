@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="{{ @this->lang() }}">
+<head>
+    <include href="blocks/head.html" />
+    <title>{{ empty(@title) ? @site.name : @title . ' - ' . @site.name | esc }}</title>
+</head>
+<body class="login">
+
+<h1 class="h2 text-center">
+    <a href="{{ @BASE }}/" class="nolink">
+        <check if="{{ empty(@site.logo) }}">
+            <true>{{ @site.name | esc }}</true>
+            <false>
+                <img src="{{ @site.logo | esc }}" alt="{{ @site.name | esc }}">
+            </false>
+        </check>
+    </a>
+</h1>
+
+<br><br>
+
+<div class="container-fluid">
+    <div class="row">
+        <div class="col-sm-4 {{ @site.public_registration ? 'col-sm-offset-2' : 'col-sm-offset-4' }}">
+            <form action="{{ @BASE }}/login" method="post" class="form-horizontal">
+                <csrf-token />
+                <div class="clearfix">
+                    <h3 class="col-md-8 col-md-offset-4">{{ @dict.log_in }}</h3>
+                </div>
+                <input type="hidden" name="to" value="{{ (empty(@to) ? '/' : @to) | esc }}">
+                <check if="{{ !empty(@login.error) }}">
+                    <p class="alert alert-danger">{{ @login.error | esc }}</p>
+                </check>
+                <div class="form-group">
+                    <label for="username" class="col-md-4 control-label">{{ @dict.username }}</label>
+                    <div class="col-md-8">
+                        <input class="form-control" placeholder="{{ @dict.username | esc }}" id="username" name="username" type="text" value="{{ !empty(@POST.username) ? @POST.username : '' | esc }}" maxlength="255" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="password" class="col-md-4 control-label">{{ @dict.password }}</label>
+                    <div class="col-md-8">
+                        <input class="form-control" placeholder="{{ @dict.password | esc }}" id="password" name="password" type="password" maxlength="1024" autocomplete="current-password" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="col-lg-8 col-lg-offset-4">
+                        <button type="submit" class="btn btn-primary">{{ @dict.log_in }}</button>
+                        <a href="{{ @BASE }}/reset" class="btn btn-link">{{ @dict.reset_password }}</a>
+                    </div>
+                </div>
+            </form>
+            {~ \Helper\Plugin::instance()->callHook('render.login.after_login') ~}
+        </div>
+        <check if="{{ @site.public_registration }}">
+            <div class="col-sm-4">
+                <form action="{{ @BASE }}/register" method="post" class="form-horizontal">
+                    <csrf-token />
+                    <div class="clearfix">
+                        <h3 class="col-md-8 col-md-offset-4">{{ @dict.register }}</h3>
+                    </div>
+                    <input type="hidden" name="to" value="{{ (empty(@to) ? '/' : @to) | esc }}">
+                    <check if="{{ !empty(@register.error) }}">
+                        <p class="alert alert-danger">{{ @register.error | esc }}</p>
+                    </check>
+                    <div class="form-group">
+                        <label for="register-name" class="col-md-4 control-label">{{ @dict.name }}</label>
+                        <div class="col-md-8">
+                            <input class="form-control" placeholder="{{ @dict.name }}" id="register-name" name="register-name" type="text" maxlength="255" autocomplete="name" value="{{ @@POST['register-name'] | esc }}" required>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="register-username" class="col-md-4 control-label">{{ @dict.username }}</label>
+                        <div class="col-md-8">
+                            <input class="form-control" placeholder="{{ @dict.username }}" id="register-username" name="register-username" type="text" maxlength="255" autocomplete="username" autocapitalize="none" spellcheck="false" value="{{ @@POST['register-username'] | esc }}" required>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="register-email" class="col-md-4 control-label">{{ @dict.email_address }}</label>
+                        <div class="col-md-8">
+                            <input class="form-control" placeholder="{{ @dict.email }}" id="register-email" name="register-email" type="email" value="{{ @@POST['register-email'] | esc }}" maxlength="254" autocomplete="email" required>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="register-password" class="col-md-4 control-label">{{ @dict.password }}</label>
+                        <div class="col-md-8">
+                            <input class="form-control" placeholder="{{ @dict.password }}" id="register-password" name="register-password" type="password" maxlength="1024" autocomplete="new-password" required>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <div class="col-lg-8 col-lg-offset-4">
+                            <button type="submit" class="btn btn-primary">{{ @dict.register }}</button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </check>
+    </div>
+</div>
+<include href="blocks/footer-scripts.html" />
+{~ \Helper\Plugin::instance()->callHook('render.login.after_footer') ~}
+</body>
+</html>
