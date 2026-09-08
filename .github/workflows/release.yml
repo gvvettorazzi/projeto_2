@@ -13,7 +13,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          curl -o composer.phar -L https://getcomposer.org/composer-stable.phar
+          curl \
+  --fail \
+  --show-error \
+  --silent \
+  --location \
+  --proto '=https' \
+  --proto-redir '=https' \
+  --tlsv1.2 \
+  --output composer.phar \
+  https://getcomposer.org/composer-stable.phar
           php composer.phar install --no-ansi --no-interaction --no-dev
 
       - name: Clean up project
