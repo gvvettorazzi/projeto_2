@@ -1,57 +1,33 @@
 <?php
 
-declare(strict_types=1);
-
 namespace Model;
 
-/**
- * Class Session
- *
- * @property int $id
- * @property string $token
- * @property string $ip
- * @property int $user_id
- * @property string $created
- */
 class Session extends \Model
 {
-    protected $_table_name = 'session';
-
     public const COOKIE_NAME = 'phproj_token';
 
-    /**
-     * 256 bits of entropy.
-     *
-     * The browser receives the raw token.
-     * The database stores only its SHA-256 digest.
-     */
     private const TOKEN_BYTES = 32;
 
-    /**
-     * Maximum accepted cookie token size.
+    /*
+     * Limites defensivos para impedir configuração incorreta
+     * de manter sessões indefinidamente.
      */
-    private const MAX_TOKEN_LENGTH = 128;
+    private const DEFAULT_LIFETIME = 86400;      // 24 horas
+    private const MAX_LIFETIME = 2592000;        // 30 dias
+    private const ROTATION_DIVISOR = 2;
+
+    protected $_table_name = 'session';
 
     /**
-     * Minimum allowed session lifetime.
-     */
-    private const MIN_SESSION_LIFETIME = 300;
-
-    /**
-     * Maximum session lifetime: 30 days.
-     */
-    private const MAX_SESSION_LIFETIME = 2592000;
-
-    /**
-     * Raw token exists only in memory long enough
-     * to be sent to the browser.
+     * Token em texto puro existe apenas durante a requisição
+     * que cria ou rotaciona a sessão.
      *
-     * It is never persisted in the database.
+     * O banco recebe somente SHA-256(token).
      */
     private ?string $rawToken = null;
 
     /**
-     * Create a new authenticated session.
+     * Cria uma nova sessão autenticada.
      */
     public function __construct(
         ?int $user_id = null,
@@ -63,21 +39,23 @@ class Session extends \Model
             return;
         }
 
-        if ($user_id <= 0) {
+        $userId = self::validateUserId($user_id);
+
+        if ($userId === null) {
             throw new \InvalidArgumentException(
-                'Invalid user identifier.'
+                'Invalid user.'
             );
         }
 
         /*
-         * Ensure an authentication session cannot be created for
-         * a deleted or nonexistent account.
+         * Nunca criar sessão para usuário inexistente
+         * ou excluído.
          */
         $user = new User();
 
         $user->load([
             'id = ? AND deleted_date IS NULL',
-            $user_id,
+            $userId,
         ]);
 
         if (!$user->id) {
@@ -86,83 +64,67 @@ class Session extends \Model
             );
         }
 
-        $this->user_id = $user_id;
-
-        /*
-         * Generate a new cryptographically secure random token.
-         */
-        $this->rawToken = self::generateToken();
-
-        /*
-         * Only the digest is persisted.
-         *
-         * A database leak therefore does not directly provide
-         * usable browser session tokens.
-         */
-        $this->token = self::tokenDigest(
-            $this->rawToken
-        );
-
-        $this->ip = self::currentIp();
+        $this->user_id = $userId;
 
         $this->created = date(
             'Y-m-d H:i:s'
         );
 
+        $this->ip = self::currentIp();
+
+        $this->generateToken();
+
         if ($auto_save) {
-            $this->save();
+            parent::save();
         }
     }
 
     /**
-     * Load and validate the current browser session.
+     * Carrega e valida a sessão atual.
      */
     public function loadCurrent(): Session
     {
-        $f3 = \Base::instance();
+        $rawToken = $this->getCookieToken();
 
-        $rawToken = $f3->get(
-            'COOKIE.' . self::COOKIE_NAME
-        );
-
-        if (
-            !is_string($rawToken)
-            || !self::validTokenFormat($rawToken)
-        ) {
+        /*
+         * Validação antes de consultar o banco.
+         *
+         * Evita queries desnecessárias para cookies obviamente
+         * inválidos e reduz superfície para abuso de recursos.
+         */
+        if ($rawToken === null) {
             return $this;
         }
 
-        /*
-         * The DB contains only the digest.
-         */
-        $digest = self::tokenDigest(
+        $tokenHash = self::hashToken(
             $rawToken
         );
 
+        /*
+         * O banco contém somente o hash.
+         */
         $this->load([
             'token = ?',
-            $digest,
+            $tokenHash,
         ]);
 
-        if (!$this->id) {
-            /*
-             * Invalid cookie: remove it without revealing
-             * whether a corresponding session ever existed.
-             */
-            self::expireCookie();
+        if (
+            !$this->id
+            || !is_string($this->token)
+            || $this->token === ''
+        ) {
+            self::clearBrowserCookie();
 
             return $this;
         }
 
         /*
-         * Verify the stored digest using a timing-resistant
-         * comparison as defense in depth.
+         * Comparação constante para evitar diferenças de timing.
          */
         if (
-            !is_string($this->token)
-            || !hash_equals(
+            !hash_equals(
                 $this->token,
-                $digest
+                $tokenHash
             )
         ) {
             $this->invalidate();
@@ -171,19 +133,46 @@ class Session extends \Model
         }
 
         /*
-         * Ensure the referenced user is still active.
+         * Sessão precisa estar ligada a um usuário válido.
          */
-        if (!$this->hasValidUser()) {
+        $userId = self::validateUserId(
+            $this->user_id
+        );
+
+        if ($userId === null) {
             $this->invalidate();
 
             return $this;
         }
 
-        $createdTimestamp = strtotime(
-            (string) $this->created
-        );
+        /*
+         * Usuário excluído/desativado não pode continuar usando
+         * uma sessão antiga.
+         */
+        if (!$this->isUserActive($userId)) {
+            $this->invalidate();
+
+            return $this;
+        }
+
+        $createdTimestamp =
+            strtotime(
+                (string) $this->created
+            );
 
         if ($createdTimestamp === false) {
+            $this->invalidate();
+
+            return $this;
+        }
+
+        $now = time();
+
+        /*
+         * Timestamp futuro pode indicar corrupção/manipulação
+         * de estado.
+         */
+        if ($createdTimestamp > ($now + 60)) {
             $this->invalidate();
 
             return $this;
@@ -192,33 +181,35 @@ class Session extends \Model
         $lifetime =
             self::sessionLifetime();
 
-        $duration =
-            time() - $createdTimestamp;
+        $age =
+            $now - $createdTimestamp;
 
         /*
-         * Reject clock-corrupted/future session records.
+         * Sessão expirada.
          */
-        if ($duration < -60) {
+        if (
+            $age < 0
+            || $age > $lifetime
+        ) {
             $this->invalidate();
 
             return $this;
         }
 
         /*
-         * Expired session.
+         * Rotação periódica reduz a janela de reutilização de
+         * um token eventualmente comprometido.
          */
-        if ($duration >= $lifetime) {
-            $this->invalidate();
+        $rotationAge =
+            max(
+                300,
+                intdiv(
+                    $lifetime,
+                    self::ROTATION_DIVISOR
+                )
+            );
 
-            return $this;
-        }
-
-        /*
-         * Rotate the token once half of the lifetime has elapsed.
-         *
-         * Token rotation limits the useful lifetime of a stolen token.
-         */
-        if ($duration >= ($lifetime / 2)) {
+        if ($age >= $rotationAge) {
             $this->rotateToken();
         }
 
@@ -226,40 +217,39 @@ class Session extends \Model
     }
 
     /**
-     * Send the current session token to the browser.
+     * Define esta sessão como atual no navegador.
      */
     public function setCurrent(): Session
     {
-        /*
-         * Never place the database digest in the browser.
-         *
-         * setCurrent() must only operate when a fresh plaintext
-         * token exists in memory.
-         */
         if (
-            $this->rawToken === null
-            || !self::validTokenFormat(
-                $this->rawToken
-            )
+            !$this->id
+            || $this->rawToken === null
         ) {
             return $this;
         }
 
-        self::writeCookie(
-            $this->rawToken
-        );
+        if (
+            !self::isValidRawToken(
+                $this->rawToken
+            )
+        ) {
+            throw new \RuntimeException(
+                'Invalid session token.'
+            );
+        }
 
-        $this->logSecurityEvent(
-            'Session cookie set'
+        self::sendCookie(
+            $this->rawToken
         );
 
         return $this;
     }
 
     /**
-     * Rotate the session token.
+     * Rotaciona o token da sessão.
      *
-     * The previous token becomes invalid immediately.
+     * Útil contra session fixation e reduz o tempo útil de
+     * tokens capturados.
      */
     public function rotateToken(): Session
     {
@@ -267,13 +257,21 @@ class Session extends \Model
             return $this;
         }
 
-        $this->rawToken =
-            self::generateToken();
-
-        $this->token =
-            self::tokenDigest(
-                $this->rawToken
+        $userId =
+            self::validateUserId(
+                $this->user_id
             );
+
+        if (
+            $userId === null
+            || !$this->isUserActive($userId)
+        ) {
+            $this->invalidate();
+
+            return $this;
+        }
+
+        $this->generateToken();
 
         $this->created =
             date('Y-m-d H:i:s');
@@ -281,119 +279,156 @@ class Session extends \Model
         $this->ip =
             self::currentIp();
 
-        $this->save();
+        parent::save();
 
         $this->setCurrent();
 
-        $this->logSecurityEvent(
-            'Session token rotated'
-        );
-
         return $this;
     }
 
     /**
-     * Delete/invalidate session.
+     * Exclui a sessão.
      */
     public function delete(): Session
     {
-        if (!$this->id) {
-            self::expireCookie();
-
-            return $this;
-        }
-
-        $f3 = \Base::instance();
-
-        $cookieToken = $f3->get(
-            'COOKIE.' . self::COOKIE_NAME
-        );
-
         /*
-         * Only remove the browser cookie when it corresponds
-         * to this session.
+         * Limpa o cookie somente quando esta instância representa
+         * a sessão atualmente utilizada pelo navegador.
+         *
+         * Isso evita que a exclusão administrativa de outra sessão
+         * derrube a sessão atual.
          */
-        if (
-            is_string($cookieToken)
-            && self::validTokenFormat(
-                $cookieToken
-            )
-            && is_string($this->token)
-        ) {
-            $cookieDigest =
-                self::tokenDigest(
-                    $cookieToken
-                );
-
-            if (
-                hash_equals(
-                    $this->token,
-                    $cookieDigest
-                )
-            ) {
-                self::expireCookie();
-            }
+        if ($this->isCurrentBrowserSession()) {
+            self::clearBrowserCookie();
         }
-
-        $sessionId =
-            (int) $this->id;
-
-        parent::delete();
-
-        /*
-         * Never log tokens or the complete model.
-         */
-        $this->logSecurityEvent(
-            'Session deleted',
-            $sessionId
-        );
-
-        $this->rawToken = null;
-
-        return $this;
-    }
-
-    /**
-     * Explicitly invalidate a compromised or unusable session.
-     */
-    private function invalidate(): void
-    {
-        $sessionId =
-            (int) ($this->id ?? 0);
 
         if ($this->id) {
             parent::delete();
         }
 
-        self::expireCookie();
+        $this->rawToken = null;
+
+        return $this;
+    }
+
+    /**
+     * Invalidação explícita de sessão comprometida, expirada
+     * ou inconsistente.
+     */
+    public function invalidate(): Session
+    {
+        if ($this->isCurrentBrowserSession()) {
+            self::clearBrowserCookie();
+        }
+
+        if ($this->id) {
+            parent::delete();
+        }
 
         $this->rawToken = null;
 
-        $this->logSecurityEvent(
-            'Session invalidated',
-            $sessionId
+        return $this;
+    }
+
+    /**
+     * Cria token criptograficamente seguro.
+     */
+    private function generateToken(): void
+    {
+        $rawToken =
+            bin2hex(
+                random_bytes(
+                    self::TOKEN_BYTES
+                )
+            );
+
+        if (
+            !self::isValidRawToken(
+                $rawToken
+            )
+        ) {
+            throw new \RuntimeException(
+                'Unable to create secure session token.'
+            );
+        }
+
+        $this->rawToken =
+            $rawToken;
+
+        /*
+         * Nunca persistimos o bearer token propriamente dito.
+         */
+        $this->token =
+            self::hashToken(
+                $rawToken
+            );
+    }
+
+    /**
+     * Obtém cookie somente se tiver exatamente o formato esperado.
+     */
+    private function getCookieToken(): ?string
+    {
+        $value =
+            \Base::instance()
+                ->get(
+                    'COOKIE.'
+                    . self::COOKIE_NAME
+                );
+
+        if (!is_string($value)) {
+            return null;
+        }
+
+        $value = trim($value);
+
+        if (
+            !self::isValidRawToken(
+                $value
+            )
+        ) {
+            /*
+             * Cookie malformado não deve permanecer sendo enviado
+             * a cada requisição.
+             */
+            self::clearBrowserCookie();
+
+            return null;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Token bruto = 32 bytes representados por 64 caracteres hex.
+     */
+    private static function isValidRawToken(
+        string $token
+    ): bool {
+        return preg_match(
+            '/\A[a-f0-9]{64}\z/D',
+            $token
+        ) === 1;
+    }
+
+    /**
+     * Hash determinístico necessário para localizar a sessão.
+     */
+    private static function hashToken(
+        string $token
+    ): string {
+        return hash(
+            'sha256',
+            $token
         );
     }
 
     /**
-     * Verify that the session still belongs to an active user.
+     * Confirma que o usuário associado continua ativo.
      */
-    private function hasValidUser(): bool
-    {
-        $userId = filter_var(
-            $this->user_id,
-            FILTER_VALIDATE_INT,
-            [
-                'options' => [
-                    'min_range' => 1,
-                ],
-            ]
-        );
-
-        if ($userId === false) {
-            return false;
-        }
-
+    private function isUserActive(
+        int $userId
+    ): bool {
         $user = new User();
 
         $user->load([
@@ -405,92 +440,140 @@ class Session extends \Model
     }
 
     /**
-     * Generate a cryptographically secure session token.
+     * Identifica se esta instância representa a sessão
+     * atualmente enviada pelo navegador.
      */
-    private static function generateToken(): string
+    private function isCurrentBrowserSession(): bool
     {
-        return bin2hex(
-            random_bytes(
-                self::TOKEN_BYTES
-            )
-        );
-    }
-
-    /**
-     * Generate the digest persisted in the database.
-     *
-     * SHA-256 is appropriate here because the input is already a
-     * cryptographically random 256-bit token and is not a password.
-     */
-    private static function tokenDigest(
-        string $token
-    ): string {
-        return hash(
-            'sha256',
-            $token
-        );
-    }
-
-    /**
-     * Validate the externally supplied session token.
-     *
-     * raw token = 32 bytes represented as 64 hexadecimal characters.
-     */
-    private static function validTokenFormat(
-        string $token
-    ): bool {
         if (
-            $token === ''
-            || strlen($token) >
-                self::MAX_TOKEN_LENGTH
+            !is_string($this->token)
+            || $this->token === ''
         ) {
             return false;
         }
 
-        return preg_match(
-            '/^[a-f0-9]{64}$/D',
-            $token
-        ) === 1;
+        $rawToken =
+            $this->getCookieToken();
+
+        if ($rawToken === null) {
+            return false;
+        }
+
+        $browserHash =
+            self::hashToken(
+                $rawToken
+            );
+
+        return hash_equals(
+            $this->token,
+            $browserHash
+        );
     }
 
     /**
-     * Safely obtain configured session lifetime.
+     * Validação rígida do identificador de usuário.
+     */
+    private static function validateUserId(
+        mixed $value
+    ): ?int {
+        if (
+            $value === null
+            || $value === ''
+            || is_bool($value)
+        ) {
+            return null;
+        }
+
+        $id =
+            filter_var(
+                $value,
+                FILTER_VALIDATE_INT,
+                [
+                    'options' => [
+                        'min_range' => 1,
+                    ],
+                ]
+            );
+
+        return $id === false
+            ? null
+            : $id;
+    }
+
+    /**
+     * Limita o tempo de sessão para evitar erro de configuração
+     * causando sessões praticamente permanentes.
      */
     private static function sessionLifetime(): int
     {
-        $configured = filter_var(
-            \Base::instance()->get(
-                'session_lifetime'
-            ),
-            FILTER_VALIDATE_INT
-        );
+        $configured =
+            (int) \Base::instance()
+                ->get(
+                    'session_lifetime'
+                );
 
-        if ($configured === false) {
-            /*
-             * Secure default: two hours.
-             */
-            return 7200;
+        if (
+            $configured <= 0
+            || $configured
+                > self::MAX_LIFETIME
+        ) {
+            return self::DEFAULT_LIFETIME;
         }
 
-        return max(
-            self::MIN_SESSION_LIFETIME,
-            min(
-                (int) $configured,
-                self::MAX_SESSION_LIFETIME
-            )
-        );
+        return $configured;
     }
 
     /**
-     * Write an authentication cookie with secure attributes.
+     * IP é apenas dado auxiliar.
+     *
+     * Não fazemos bloqueio rígido por IP porque usuários móveis,
+     * VPNs e proxies podem trocar de IP legitimamente.
      */
-    private static function writeCookie(
+    private static function currentIp(): ?string
+    {
+        $ip =
+            \Base::instance()
+                ->get('IP');
+
+        if (!is_string($ip)) {
+            return null;
+        }
+
+        $ip = trim($ip);
+
+        if (
+            filter_var(
+                $ip,
+                FILTER_VALIDATE_IP
+            ) === false
+        ) {
+            return null;
+        }
+
+        /*
+         * Limite defensivo para o campo do banco.
+         * IPv6 textual cabe confortavelmente.
+         */
+        if (strlen($ip) > 45) {
+            return null;
+        }
+
+        return $ip;
+    }
+
+    /**
+     * Envia cookie de autenticação com configurações seguras.
+     */
+    private static function sendCookie(
         string $token
     ): void {
-        if (headers_sent()) {
-            throw new \RuntimeException(
-                'Unable to establish secure session.'
-            );
+        if (
+            headers_sent()
+            || !self::isValidRawToken(
+                $token
+            )
+        ) {
+            return;
         }
 
         $lifetime =
@@ -506,15 +589,21 @@ class Session extends \Model
                 'path' =>
                     '/',
 
+                /*
+                 * Em produção HTTPS isso deve ser true.
+                 */
                 'secure' =>
                     self::isHttps(),
 
+                /*
+                 * JavaScript não pode acessar o token.
+                 */
                 'httponly' =>
                     true,
 
                 /*
-                 * Lax normally provides a good balance for standard
-                 * web applications while reducing CSRF exposure.
+                 * Lax protege contra vários cenários CSRF
+                 * sem quebrar navegação normal.
                  */
                 'samesite' =>
                     'Lax',
@@ -522,18 +611,19 @@ class Session extends \Model
         );
 
         /*
-         * Keep F3's current request state synchronized.
+         * Mantém o hive F3 coerente durante esta requisição.
          */
         \Base::instance()->set(
-            'COOKIE.' . self::COOKIE_NAME,
+            'COOKIE.'
+            . self::COOKIE_NAME,
             $token
         );
     }
 
     /**
-     * Delete the authentication cookie securely.
+     * Expira cookie de autenticação.
      */
-    private static function expireCookie(): void
+    private static function clearBrowserCookie(): void
     {
         if (!headers_sent()) {
             setcookie(
@@ -558,112 +648,51 @@ class Session extends \Model
             );
         }
 
-        \Base::instance()->set(
-            'COOKIE.' . self::COOKIE_NAME,
-            ''
+        \Base::instance()->clear(
+            'COOKIE.'
+            . self::COOKIE_NAME
         );
     }
 
     /**
-     * Determine whether the current request is HTTPS.
+     * Detecta HTTPS sem confiar diretamente em headers
+     * Forwarded enviados pelo cliente.
      */
     private static function isHttps(): bool
     {
-        $f3 = \Base::instance();
+        $f3 =
+            \Base::instance();
 
-        $scheme = strtolower(
-            (string) $f3->get('SCHEME')
-        );
+        $scheme =
+            strtolower(
+                trim(
+                    (string) $f3->get(
+                        'SCHEME'
+                    )
+                )
+            );
 
         if ($scheme === 'https') {
             return true;
         }
 
-        $https = strtolower(
-            (string) $f3->get(
-                'SERVER.HTTPS'
-            )
-        );
+        $https =
+            strtolower(
+                trim(
+                    (string) $f3->get(
+                        'SERVER.HTTPS'
+                    )
+                )
+            );
 
-        return $https !== ''
-            && $https !== 'off'
-            && $https !== '0';
-    }
-
-    /**
-     * Obtain the current client IP for auditing.
-     *
-     * The IP is not used as the sole session authentication factor,
-     * since legitimate addresses may change during a session.
-     */
-    private static function currentIp(): string
-    {
-        $ip = \Base::instance()->get(
-            'IP'
-        );
-
-        if (!is_string($ip)) {
-            return '';
-        }
-
-        $ip = trim($ip);
-
-        if (
-            filter_var(
-                $ip,
-                FILTER_VALIDATE_IP
-            ) === false
-        ) {
-            return '';
-        }
-
-        /*
-         * Maximum textual IPv6 length is 45 characters.
-         */
-        return substr(
-            $ip,
-            0,
-            45
-        );
-    }
-
-    /**
-     * Security logging without exposing secrets.
-     */
-    private function logSecurityEvent(
-        string $message,
-        ?int $sessionId = null
-    ): void {
-        $f3 = \Base::instance();
-
-        if (!$f3->get('DEBUG')) {
-            return;
-        }
-
-        $sessionId ??=
-            (int) ($this->id ?? 0);
-
-        $userId =
-            (int) ($this->user_id ?? 0);
-
-        $log = new \Log(
-            'session.log'
-        );
-
-        /*
-         * Never log:
-         * - session token
-         * - cookie contents
-         * - complete model cast
-         * - authentication secrets
-         */
-        $log->write(
-            sprintf(
-                '%s; session_id=%d; user_id=%d',
-                $message,
-                $sessionId,
-                $userId
-            )
+        return in_array(
+            $https,
+            [
+                'on',
+                '1',
+                'true',
+            ],
+            true
         );
     }
 }
