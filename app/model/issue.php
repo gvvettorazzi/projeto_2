@@ -6,69 +6,185 @@ class Issue extends \Model
 {
     private const MAX_HIERARCHY_DEPTH = 100;
 
-    protected $_table_name = "issue";
+    private const REPEAT_CYCLES = [
+        'daily',
+        'weekly',
+        'monthly',
+        'quarterly',
+        'semi_annually',
+        'annually',
+        'sprint',
+    ];
+
+    private const IMPORTANT_UPDATE_FIELDS = [
+        'status',
+        'name',
+        'description',
+        'owner_id',
+        'priority',
+        'due_date',
+    ];
+
+    protected $_table_name = 'issue';
+
     protected $_heirarchy;
     protected $_children;
 
     protected static $requiredFields = [
-        "type_id",
-        "status",
-        "name",
-        "author_id",
+        'type_id',
+        'status',
+        'name',
+        'author_id',
     ];
 
+    /**
+     * Create a new issue.
+     */
     public static function create(array $data, bool $notify = true): static
     {
-        if (isset($data["hours"])) {
-            $data["hours_total"] = $data["hours"];
-            $data["hours_remaining"] = $data["hours"];
-            unset($data["hours"]);
-        }
+        $data = self::normalizeCreateData($data);
 
-        if (!empty($data["due_date"])) {
-            if (
-                preg_match(
-                    "/\\d{4}(-\\d{2}){2}/",
-                    (string) $data["due_date"]
-                ) === false
-            ) {
-                $data["due_date"] = date(
-                    "Y-m-d",
-                    strtotime((string) $data["due_date"])
-                );
-            }
+        if (empty($data['author_id'])) {
+            $userId = self::positiveInt(
+                \Base::instance()->get('user.id')
+            );
 
-            if (
-                empty($data["sprint_id"])
-                && !empty($data["due_date_sprint"])
-            ) {
-                $sprint = new Sprint();
-                $sprint->load([
-                    "DATE(?) BETWEEN start_date AND end_date",
-                    $data["due_date"],
-                ]);
-
-                $data["sprint_id"] = $sprint->id;
+            if ($userId !== null) {
+                $data['author_id'] = $userId;
             }
         }
 
-        if (
-            empty($data["author_id"])
-            && $userId = \Base::instance()->get("user.id")
-        ) {
-            $data["author_id"] = $userId;
-        }
-
+        /** @var static $item */
         $item = parent::create($data);
 
-        if ($notify) {
+        if ($notify && $item->id) {
             \Helper\Notification::instance()
-                ->issue_create($item->id);
+                ->issue_create((int) $item->id);
         }
 
         return $item;
     }
 
+    /**
+     * Normalize values received when creating an issue.
+     */
+    private static function normalizeCreateData(array $data): array
+    {
+        if (isset($data['name'])) {
+            $data['name'] = trim((string) $data['name']);
+        }
+
+        if (isset($data['description'])) {
+            $data['description'] = self::clean(
+                (string) $data['description']
+            );
+        }
+
+        foreach (
+            [
+                'type_id',
+                'status',
+                'author_id',
+                'owner_id',
+                'parent_id',
+                'sprint_id',
+                'priority',
+            ] as $field
+        ) {
+            if (!array_key_exists($field, $data)) {
+                continue;
+            }
+
+            if (
+                in_array(
+                    $field,
+                    ['owner_id', 'parent_id', 'sprint_id'],
+                    true
+                )
+            ) {
+                $data[$field] = self::nullablePositiveInt(
+                    $data[$field]
+                );
+            } else {
+                $normalized = self::positiveInt($data[$field]);
+
+                if ($normalized !== null) {
+                    $data[$field] = $normalized;
+                }
+            }
+        }
+
+        if (array_key_exists('hours', $data)) {
+            $hours = self::nullableNonNegativeFloat(
+                $data['hours']
+            );
+
+            $data['hours_total'] = $hours;
+            $data['hours_remaining'] = $hours;
+
+            unset($data['hours']);
+        }
+
+        foreach (
+            [
+                'hours_total',
+                'hours_remaining',
+                'hours_spent',
+            ] as $field
+        ) {
+            if (array_key_exists($field, $data)) {
+                $data[$field] =
+                    self::nullableNonNegativeFloat(
+                        $data[$field]
+                    );
+            }
+        }
+
+        foreach (
+            ['start_date', 'due_date'] as $field
+        ) {
+            if (
+                array_key_exists($field, $data)
+                && $data[$field] !== null
+                && $data[$field] !== ''
+            ) {
+                $data[$field] = self::normalizeDate(
+                    $data[$field]
+                );
+            }
+        }
+
+        if (
+            empty($data['sprint_id'])
+            && !empty($data['due_date'])
+            && !empty($data['due_date_sprint'])
+        ) {
+            $sprint = new Sprint();
+
+            $sprint->load([
+                'DATE(?) BETWEEN start_date AND end_date',
+                $data['due_date'],
+            ]);
+
+            if ($sprint->id) {
+                $data['sprint_id'] =
+                    (int) $sprint->id;
+            }
+        }
+
+        if (isset($data['repeat_cycle'])) {
+            $data['repeat_cycle'] =
+                self::normalizeRepeatCycle(
+                    $data['repeat_cycle']
+                );
+        }
+
+        return $data;
+    }
+
+    /**
+     * Get issue ancestors and protect against circular hierarchy.
+     */
     public function getAncestors(): array
     {
         if ($this->_heirarchy !== null) {
@@ -76,55 +192,101 @@ class Issue extends \Model
         }
 
         $issues = [$this];
-        $issueIds = [$this->id];
-        $parentId = $this->parent_id;
+        $visited = [];
 
-        while ($parentId) {
-            if (in_array($parentId, $issueIds)) {
+        if ($this->id) {
+            $visited[(int) $this->id] = true;
+        }
+
+        $parentId = self::positiveInt(
+            $this->parent_id
+        );
+
+        $depth = 0;
+
+        while (
+            $parentId !== null
+            && $depth < self::MAX_HIERARCHY_DEPTH
+        ) {
+            if (isset($visited[$parentId])) {
                 \Base::instance()->set(
-                    "error",
-                    "Issue parent tree contains an infinite loop. "
-                    . "Issue {$parentId} is the first point of recursion."
+                    'error',
+                    'Issue parent tree contains a circular reference.'
                 );
 
                 break;
             }
+
+            $visited[$parentId] = true;
 
             $issue = new Issue();
             $issue->load($parentId);
 
             if (!$issue->id) {
                 \Base::instance()->set(
-                    "error",
-                    "Issue parent tree references an invalid parent."
+                    'error',
+                    'Issue parent tree references an invalid issue.'
                 );
 
                 break;
             }
 
             $issues[] = $issue;
-            $issueIds[] = $issue->id;
-            $parentId = $issue->parent_id;
+
+            $parentId = self::positiveInt(
+                $issue->parent_id
+            );
+
+            $depth++;
         }
 
-        return $this->_heirarchy = array_reverse($issues);
+        if (
+            $depth >= self::MAX_HIERARCHY_DEPTH
+            && $parentId !== null
+        ) {
+            \Base::instance()->set(
+                'error',
+                'Issue hierarchy exceeded the permitted depth.'
+            );
+        }
+
+        $this->_heirarchy =
+            array_reverse($issues);
+
+        return $this->_heirarchy;
     }
 
+    /**
+     * Normalize whitespace.
+     */
     public static function clean(string $string): string
     {
-        return preg_replace(
-            '/(?:(?:\r\n|\r|\n)\s*){2}/s',
+        $string = str_replace(
+            ["\r\n", "\r"],
+            "\n",
+            $string
+        );
+
+        $result = preg_replace(
+            '/(?:\n\s*){2,}/',
             "\n\n",
-            str_replace("\r\n", "\n", $string)
+            $string
+        );
+
+        return trim(
+            $result ?? $string
         );
     }
 
+    /**
+     * Soft-delete issue.
+     */
     public function delete(bool $recursive = true): Issue
     {
         if (!$this->deleted_date) {
             $this->set(
-                "deleted_date",
-                date("Y-m-d H:i:s")
+                'deleted_date',
+                date('Y-m-d H:i:s')
             );
         }
 
@@ -135,11 +297,14 @@ class Issue extends \Model
         return $this->save(false);
     }
 
+    /**
+     * Delete descendant issues.
+     */
     protected function _deleteTree(): Issue
     {
         foreach (
             $this->find([
-                "parent_id = ?",
+                'parent_id = ?',
                 $this->id,
             ]) as $child
         ) {
@@ -149,9 +314,15 @@ class Issue extends \Model
         return $this;
     }
 
+    /**
+     * Restore issue.
+     */
     public function restore(bool $recursive = true): Issue
     {
-        $this->set("deleted_date", null);
+        $this->set(
+            'deleted_date',
+            null
+        );
 
         if ($recursive) {
             $this->_restoreTree();
@@ -160,11 +331,14 @@ class Issue extends \Model
         return $this->save(false);
     }
 
+    /**
+     * Restore descendants.
+     */
     protected function _restoreTree(): Issue
     {
         foreach (
             $this->find([
-                "parent_id = ? AND deleted_date IS NOT NULL",
+                'parent_id = ? AND deleted_date IS NOT NULL',
                 $this->id,
             ]) as $child
         ) {
@@ -174,167 +348,258 @@ class Issue extends \Model
         return $this;
     }
 
+    /**
+     * Repeat issue.
+     */
     public function repeat(bool $notify = true): Issue
     {
-        $repeatIssue = new Issue();
+        $repeat = new Issue();
 
-        $repeatIssue->name = $this->name;
-        $repeatIssue->type_id = $this->type_id;
-        $repeatIssue->parent_id = $this->parent_id;
-        $repeatIssue->author_id = $this->author_id;
-        $repeatIssue->owner_id = $this->owner_id;
-        $repeatIssue->description = $this->description;
-        $repeatIssue->priority = $this->priority;
-        $repeatIssue->repeat_cycle = $this->repeat_cycle;
-        $repeatIssue->hours_total = $this->hours_total;
-        $repeatIssue->hours_remaining = $this->hours_total;
-        $repeatIssue->created_date = date("Y-m-d H:i:s");
+        $repeat->name = trim(
+            (string) $this->name
+        );
 
-        switch ($repeatIssue->repeat_cycle) {
-            case "daily":
-                $repeatIssue->start_date = $this->start_date
-                    ? date("Y-m-d", strtotime("tomorrow"))
-                    : null;
+        $repeat->type_id =
+            (int) $this->type_id;
 
-                $repeatIssue->due_date =
-                    date("Y-m-d", strtotime("tomorrow"));
-                break;
+        $repeat->parent_id =
+            self::nullablePositiveInt(
+                $this->parent_id
+            );
 
-            case "weekly":
-                $repeatIssue->start_date = $this->start_date
-                    ? date(
-                        "Y-m-d",
-                        strtotime($this->start_date . " +1 week")
-                    )
-                    : null;
+        $repeat->author_id =
+            (int) $this->author_id;
 
-                $repeatIssue->due_date = date(
-                    "Y-m-d",
-                    strtotime($this->due_date . " +1 week")
-                );
-                break;
+        $repeat->owner_id =
+            self::nullablePositiveInt(
+                $this->owner_id
+            );
 
-            case "monthly":
-                $repeatIssue->start_date = $this->start_date
-                    ? date(
-                        "Y-m-d",
-                        strtotime($this->start_date . " +1 month")
-                    )
-                    : null;
+        $repeat->description =
+            self::clean(
+                (string) $this->description
+            );
 
-                $repeatIssue->due_date = date(
-                    "Y-m-d",
-                    strtotime($this->due_date . " +1 month")
-                );
-                break;
+        $repeat->priority =
+            (int) $this->priority;
 
-            case "quarterly":
-                $repeatIssue->start_date = $this->start_date
-                    ? date(
-                        "Y-m-d",
-                        strtotime($this->start_date . " +3 months")
-                    )
-                    : null;
+        $repeat->repeat_cycle =
+            self::normalizeRepeatCycle(
+                $this->repeat_cycle
+            );
 
-                $repeatIssue->due_date = date(
-                    "Y-m-d",
-                    strtotime($this->due_date . " +3 months")
-                );
-                break;
+        $repeat->hours_total =
+            self::nullableNonNegativeFloat(
+                $this->hours_total
+            );
 
-            case "semi_annually":
-                $repeatIssue->start_date = $this->start_date
-                    ? date(
-                        "Y-m-d",
-                        strtotime($this->start_date . " +6 months")
-                    )
-                    : null;
+        $repeat->hours_remaining =
+            $repeat->hours_total;
 
-                $repeatIssue->due_date = date(
-                    "Y-m-d",
-                    strtotime($this->due_date . " +6 months")
-                );
-                break;
+        $repeat->created_date =
+            date('Y-m-d H:i:s');
 
-            case "annually":
-                $repeatIssue->start_date = $this->start_date
-                    ? date(
-                        "Y-m-d",
-                        strtotime($this->start_date . " +1 year")
-                    )
-                    : null;
+        $this->applyRepeatDates($repeat);
 
-                $repeatIssue->due_date = date(
-                    "Y-m-d",
-                    strtotime($this->due_date . " +1 year")
-                );
-                break;
-
-            case "sprint":
-                $sprint = new Sprint();
-
-                $sprint->load(
-                    ["start_date > NOW()"],
-                    ["order" => "start_date"]
-                );
-
-                $repeatIssue->start_date = $this->start_date
-                    ? $sprint->start_date
-                    : null;
-
-                $repeatIssue->due_date = $sprint->end_date;
-                break;
-
-            default:
-                $repeatIssue->repeat_cycle = "none";
-        }
-
-        if ($this->sprint_id && $repeatIssue->due_date) {
+        if (
+            $this->sprint_id
+            && $repeat->due_date
+        ) {
             $sprint = new Sprint();
 
             $sprint->load(
                 [
-                    "end_date >= ? AND start_date <= ?",
-                    $repeatIssue->due_date,
-                    $repeatIssue->due_date,
+                    'end_date >= ? AND start_date <= ?',
+                    $repeat->due_date,
+                    $repeat->due_date,
                 ],
-                ["order" => "start_date"]
+                [
+                    'order' => 'start_date',
+                ]
             );
 
-            $repeatIssue->sprint_id = $sprint->id;
+            if ($sprint->id) {
+                $repeat->sprint_id =
+                    (int) $sprint->id;
+            }
         }
 
-        $repeatIssue->save();
+        $repeat->save();
 
-        if ($notify) {
+        if ($notify && $repeat->id) {
             \Helper\Notification::instance()
-                ->issue_create($repeatIssue->id);
+                ->issue_create(
+                    (int) $repeat->id
+                );
         }
 
-        return $repeatIssue;
+        return $repeat;
     }
 
-    protected function _saveUpdate(bool $notify = true): Issue\Update
-    {
+    /**
+     * Calculate dates for a recurring issue.
+     */
+    private function applyRepeatDates(
+        Issue $repeat
+    ): void {
+        switch ($repeat->repeat_cycle) {
+            case 'daily':
+                $repeat->start_date =
+                    $this->start_date
+                        ? date(
+                            'Y-m-d',
+                            strtotime('tomorrow')
+                        )
+                        : null;
+
+                $repeat->due_date =
+                    date(
+                        'Y-m-d',
+                        strtotime('tomorrow')
+                    );
+                break;
+
+            case 'weekly':
+                $repeat->start_date =
+                    self::shiftDate(
+                        $this->start_date,
+                        '+1 week'
+                    );
+
+                $repeat->due_date =
+                    self::shiftDate(
+                        $this->due_date,
+                        '+1 week'
+                    );
+                break;
+
+            case 'monthly':
+                $repeat->start_date =
+                    self::shiftDate(
+                        $this->start_date,
+                        '+1 month'
+                    );
+
+                $repeat->due_date =
+                    self::shiftDate(
+                        $this->due_date,
+                        '+1 month'
+                    );
+                break;
+
+            case 'quarterly':
+                $repeat->start_date =
+                    self::shiftDate(
+                        $this->start_date,
+                        '+3 months'
+                    );
+
+                $repeat->due_date =
+                    self::shiftDate(
+                        $this->due_date,
+                        '+3 months'
+                    );
+                break;
+
+            case 'semi_annually':
+                $repeat->start_date =
+                    self::shiftDate(
+                        $this->start_date,
+                        '+6 months'
+                    );
+
+                $repeat->due_date =
+                    self::shiftDate(
+                        $this->due_date,
+                        '+6 months'
+                    );
+                break;
+
+            case 'annually':
+                $repeat->start_date =
+                    self::shiftDate(
+                        $this->start_date,
+                        '+1 year'
+                    );
+
+                $repeat->due_date =
+                    self::shiftDate(
+                        $this->due_date,
+                        '+1 year'
+                    );
+                break;
+
+            case 'sprint':
+                $sprint = new Sprint();
+
+                $sprint->load(
+                    ['start_date > NOW()'],
+                    ['order' => 'start_date']
+                );
+
+                if ($sprint->id) {
+                    $repeat->start_date =
+                        $this->start_date
+                            ? $sprint->start_date
+                            : null;
+
+                    $repeat->due_date =
+                        $sprint->end_date;
+                }
+
+                break;
+        }
+    }
+
+    /**
+     * Log changes before saving.
+     */
+    protected function _saveUpdate(
+        bool $notify = true
+    ): Issue\Update|false {
         $f3 = \Base::instance();
 
-        if ($this->id == $this->parent_id) {
+        if (
+            $this->id
+            && (int) $this->id
+                === (int) $this->parent_id
+        ) {
             $this->parent_id =
-                $this->_getPrev("parent_id");
+                $this->_getPrev(
+                    'parent_id'
+                );
         }
 
         $update = new Issue\Update();
 
-        $update->issue_id = $this->id;
-        $update->user_id = $f3->get("user.id");
-        $update->created_date = date("Y-m-d H:i:s");
+        $update->issue_id =
+            (int) $this->id;
 
-        if ($f3->exists("update_comment")) {
-            $update->comment_id =
-                $f3->get("update_comment")->id;
+        $update->user_id =
+            self::positiveInt(
+                $f3->get('user.id')
+            );
 
-            $update->notify = (int) $notify;
-        } else {
+        $update->created_date =
+            date('Y-m-d H:i:s');
+
+        if ($f3->exists('update_comment')) {
+            $comment =
+                $f3->get('update_comment');
+
+            if (
+                is_object($comment)
+                && isset($comment->id)
+            ) {
+                $update->comment_id =
+                    (int) $comment->id;
+
+                $update->notify =
+                    (int) $notify;
+            }
+        }
+
+        if (!isset($update->notify)) {
             $update->notify = 0;
         }
 
@@ -343,8 +608,12 @@ class Issue extends \Model
         if (
             $this->hours_remaining
             && !$this->hours_total
-            && !$this->_getPrev("hours_remaining")
-            && !$this->_getPrev("hours_total")
+            && !$this->_getPrev(
+                'hours_remaining'
+            )
+            && !$this->_getPrev(
+                'hours_total'
+            )
         ) {
             $this->hours_total =
                 $this->hours_remaining;
@@ -368,20 +637,21 @@ class Issue extends \Model
         $updated = 0;
         $importantChanges = 0;
 
-        $importantFields = [
-            "status",
-            "name",
-            "description",
-            "owner_id",
-            "priority",
-            "due_date",
-        ];
-
-        foreach ($this->fields as $key => $field) {
+        foreach (
+            $this->fields as $key => $field
+        ) {
             if (
-                !$field["changed"]
-                || rtrim($field["value"] ?? "")
-                    === rtrim($this->_getPrev($key) ?? "")
+                empty($field['changed'])
+                || rtrim(
+                    (string) (
+                        $field['value'] ?? ''
+                    )
+                ) === rtrim(
+                    (string) (
+                        $this->_getPrev($key)
+                        ?? ''
+                    )
+                )
             ) {
                 continue;
             }
@@ -392,25 +662,27 @@ class Issue extends \Model
             $updateField->issue_update_id =
                 $update->id;
 
-            $updateField->field = $key;
+            $updateField->field =
+                (string) $key;
+
             $updateField->old_value =
                 $this->_getPrev($key);
 
             $updateField->new_value =
-                $field["value"];
+                $field['value'];
 
             $updateField->save();
 
             $updated++;
 
-            if ($key === "sprint_id") {
+            if ($key === 'sprint_id') {
                 $this->resetTaskSprints();
             }
 
             if (
                 in_array(
                     $key,
-                    $importantFields,
+                    self::IMPORTANT_UPDATE_FIELDS,
                     true
                 )
             ) {
@@ -420,81 +692,40 @@ class Issue extends \Model
 
         if ($updated === 0) {
             $update->delete();
+            return false;
         }
 
         if (
             $notify
             && $importantChanges > 0
-            && $update->id
         ) {
             $update->notify = 1;
             $update->save();
         }
 
-        return $update->id
-            ? $update
-            : false;
+        return $update;
     }
 
+    /**
+     * Save issue.
+     */
     public function save(bool $notify = true): Issue
     {
         $f3 = \Base::instance();
 
-        if ($this->sprint_id === 0) {
-            $this->set(
-                "sprint_id",
-                null
-            );
-        }
+        $this->normalizeBeforeSave();
 
         if (
-            $f3->get("security.block_ccs")
-            && preg_match(
-                "/(\\d{3,4}-){3}\\d{3,4}/",
-                $this->description
-            )
+            $f3->get('security.block_ccs')
         ) {
-            $this->set(
-                "description",
-                preg_replace(
-                    "/(\\d{3,4}-){3}(\\d{3,4})/",
-                    "************$2",
-                    $this->description
-                )
-            );
+            $this->description =
+                self::maskSensitiveNumbers(
+                    (string) $this->description
+                );
         }
 
-        $this->due_date = $this->due_date
-            ? date(
-                "Y-m-d",
-                strtotime($this->due_date)
-            )
-            : null;
-
-        $this->start_date = $this->start_date
-            ? date(
-                "Y-m-d",
-                strtotime($this->start_date)
-            )
-            : null;
-
-        if (
-            !in_array(
-                $this->repeat_cycle,
-                [
-                    "daily",
-                    "weekly",
-                    "monthly",
-                    "quarterly",
-                    "semi_annually",
-                    "annually",
-                    "sprint",
-                ],
-                true
-            )
-        ) {
-            $this->repeat_cycle = null;
-        }
+        $issue = null;
+        $update = false;
 
         if ($this->query) {
             $update =
@@ -510,41 +741,116 @@ class Issue extends \Model
             ) {
                 \Helper\Notification::instance()
                     ->issue_update(
-                        $this->id,
-                        $update->id
+                        (int) $this->id,
+                        (int) $update->id
                     );
             }
         } elseif (
             !$this->closed_date
             && $this->status
         ) {
-            $status = new Issue\Status();
+            $status =
+                new Issue\Status();
 
-            $status->load($this->status);
+            $status->load(
+                (int) $this->status
+            );
 
-            if ($status->closed) {
+            if (
+                $status->id
+                && $status->closed
+            ) {
                 $this->closed_date =
-                    date("Y-m-d H:i:s");
+                    date('Y-m-d H:i:s');
             }
         }
 
-        $return =
-            empty($issue)
-                ? parent::save()
-                : $issue;
+        if ($issue === null) {
+            $issue = parent::save();
+        }
 
         $this->saveTags();
 
-        return $return;
+        return $issue;
     }
 
+    /**
+     * Normalize data immediately before persistence.
+     */
+    private function normalizeBeforeSave(): void
+    {
+        if ($this->sprint_id === 0) {
+            $this->sprint_id = null;
+        }
+
+        $this->name =
+            trim((string) $this->name);
+
+        $this->description =
+            self::clean(
+                (string) $this->description
+            );
+
+        if ($this->due_date) {
+            $this->due_date =
+                self::normalizeDate(
+                    $this->due_date
+                );
+        }
+
+        if ($this->start_date) {
+            $this->start_date =
+                self::normalizeDate(
+                    $this->start_date
+                );
+        }
+
+        $this->repeat_cycle =
+            self::normalizeRepeatCycle(
+                $this->repeat_cycle
+            );
+
+        $this->parent_id =
+            self::nullablePositiveInt(
+                $this->parent_id
+            );
+
+        $this->owner_id =
+            self::nullablePositiveInt(
+                $this->owner_id
+            );
+
+        $this->sprint_id =
+            self::nullablePositiveInt(
+                $this->sprint_id
+            );
+
+        $this->hours_total =
+            self::nullableNonNegativeFloat(
+                $this->hours_total
+            );
+
+        $this->hours_remaining =
+            self::nullableNonNegativeFloat(
+                $this->hours_remaining
+            );
+
+        $this->hours_spent =
+            self::nullableNonNegativeFloat(
+                $this->hours_spent
+            );
+    }
+
+    /**
+     * Save tags found in description.
+     */
     public function saveTags(): Issue
     {
         $tag = new Issue\Tag();
 
         if ($this->id) {
             $tag->deleteByIssueId(
-                $this->id
+                (int) $this->id
             );
         }
 
@@ -552,9 +858,16 @@ class Issue extends \Model
             return $this;
         }
 
+        $description =
+            (string) $this->description;
+
+        if ($description === '') {
+            return $this;
+        }
+
         $count = preg_match_all(
-            "/(?<=[^a-z\\/&]#|^#)[a-z][a-z0-9_-]*[a-z0-9]+(?=[^a-z\\/]|$)/i",
-            $this->description,
+            '/(?<=[^a-z\/&]#|^#)[a-z][a-z0-9_-]*[a-z0-9]+(?=[^a-z\/]|$)/i',
+            $description,
             $matches
         );
 
@@ -562,141 +875,191 @@ class Issue extends \Model
             return $this;
         }
 
+        $saved = [];
+
         foreach ($matches[0] as $match) {
+            $normalized =
+                preg_replace(
+                    '/[_-]+/',
+                    '-',
+                    ltrim(
+                        (string) $match,
+                        '#'
+                    )
+                );
+
+            $normalized =
+                trim(
+                    (string) $normalized
+                );
+
+            if (
+                $normalized === ''
+                || isset($saved[$normalized])
+            ) {
+                continue;
+            }
+
+            $saved[$normalized] = true;
+
             $tag->reset();
+            $tag->tag = $normalized;
+            $tag->issue_id =
+                (int) $this->id;
 
-            $tag->tag = preg_replace(
-                "/[_-]+/",
-                "-",
-                ltrim($match, "#")
-            );
-
-            $tag->issue_id = $this->id;
             $tag->save();
         }
 
         return $this;
     }
 
+    /**
+     * Duplicate issue.
+     */
     public function duplicate(
         bool $recursive = true
     ): Issue {
         if (!$this->id) {
             throw new \Exception(
-                "Cannot duplicate an issue that is not yet saved."
+                'Cannot duplicate an issue that is not yet saved.'
             );
         }
 
-        $f3 = \Base::instance();
-
-        $this->copyto(
-            "duplicating_issue"
-        );
-
-        $f3->clear(
-            "duplicating_issue.id"
-        );
-
-        $f3->clear(
-            "duplicating_issue.due_date"
-        );
-
-        $f3->clear(
-            "duplicating_issue.hours_spent"
-        );
-
-        $newIssue = new Issue();
-
-        $newIssue->copyfrom(
-            "duplicating_issue"
-        );
-
-        $newIssue->author_id =
-            $f3->get("user.id");
-
-        $newIssue->hours_remaining =
-            $newIssue->hours_total;
-
-        $newIssue->created_date =
-            date("Y-m-d H:i:s");
-
-        $newIssue->save();
+        $newIssue =
+            $this->duplicateIssue(
+                $this,
+                null,
+                true
+            );
 
         if ($recursive) {
             $this->_duplicateTree(
-                $this->id,
-                $newIssue->id
+                (int) $this->id,
+                (int) $newIssue->id
             );
         }
 
         return $newIssue;
     }
 
+    /**
+     * Duplicate children.
+     */
     protected function _duplicateTree(
         int $id,
         int $newId
     ): Issue {
-        $children = $this->find([
-            "parent_id = ?",
+        $visited = [];
+
+        $this->duplicateTree(
             $id,
-        ]);
-
-        if (!$children) {
-            return $this;
-        }
-
-        $f3 = \Base::instance();
-
-        foreach ($children as $child) {
-            if ($child->deleted_date) {
-                continue;
-            }
-
-            $child->copyto(
-                "duplicating_issue"
-            );
-
-            $f3->clear(
-                "duplicating_issue.id"
-            );
-
-            $f3->clear(
-                "duplicating_issue.due_date"
-            );
-
-            $f3->clear(
-                "duplicating_issue.hours_spent"
-            );
-
-            $newChild = new Issue();
-
-            $newChild->copyfrom(
-                "duplicating_issue"
-            );
-
-            $newChild->author_id =
-                $f3->get("user.id");
-
-            $newChild->hours_remaining =
-                $newChild->hours_total;
-
-            $newChild->parent_id =
-                $newId;
-
-            $newChild->created_date =
-                date("Y-m-d H:i:s");
-
-            $newChild->save(false);
-
-            $this->_duplicateTree(
-                $child->id,
-                $newChild->id
-            );
-        }
+            $newId,
+            $visited,
+            0
+        );
 
         return $this;
     }
 
+    private function duplicateTree(
+        int $id,
+        int $newId,
+        array &$visited,
+        int $depth
+    ): void {
+        if (
+            $depth >=
+                self::MAX_HIERARCHY_DEPTH
+            || isset($visited[$id])
+        ) {
+            return;
+        }
+
+        $visited[$id] = true;
+
+        foreach (
+            $this->find([
+                'parent_id = ?',
+                $id,
+            ]) as $child
+        ) {
+            if (
+                !$child->id
+                || $child->deleted_date
+            ) {
+                continue;
+            }
+
+            $newChild =
+                $this->duplicateIssue(
+                    $child,
+                    $newId,
+                    false
+                );
+
+            $this->duplicateTree(
+                (int) $child->id,
+                (int) $newChild->id,
+                $visited,
+                $depth + 1
+            );
+        }
+    }
+
+    private function duplicateIssue(
+        Issue $source,
+        ?int $parentId,
+        bool $notify
+    ): Issue {
+        $f3 = \Base::instance();
+
+        $source->copyto(
+            'duplicating_issue'
+        );
+
+        foreach (
+            [
+                'id',
+                'due_date',
+                'hours_spent',
+            ] as $field
+        ) {
+            $f3->clear(
+                'duplicating_issue.'
+                . $field
+            );
+        }
+
+        $issue = new Issue();
+
+        $issue->copyfrom(
+            'duplicating_issue'
+        );
+
+        $issue->author_id =
+            (int) $f3->get(
+                'user.id'
+            );
+
+        $issue->hours_remaining =
+            $issue->hours_total;
+
+        $issue->created_date =
+            date('Y-m-d H:i:s');
+
+        if ($parentId !== null) {
+            $issue->parent_id =
+                $parentId;
+        }
+
+        $issue->save($notify);
+
+        return $issue;
+    }
+
+    /**
+     * Move child tasks to same sprint.
+     */
     public function resetTaskSprints(
         bool $replaceExisting = true
     ): Issue {
@@ -704,59 +1067,74 @@ class Issue extends \Model
             return $this;
         }
 
-        $f3 = \Base::instance();
-
         $query =
-            "UPDATE issue "
-            . "SET sprint_id = :sprint "
-            . "WHERE parent_id = :issue "
-            . "AND type_id != :type";
+            'UPDATE issue '
+            . 'SET sprint_id = :sprint '
+            . 'WHERE parent_id = :issue '
+            . 'AND type_id != :type';
 
         if ($replaceExisting) {
             $query .=
-                " AND sprint_id IS NULL";
+                ' AND sprint_id IS NULL';
         }
 
         $this->db->exec(
             $query,
             [
-                ":sprint" =>
-                    $this->sprint_id,
+                ':sprint' =>
+                    (int) $this->sprint_id,
 
-                ":issue" =>
-                    $this->id,
+                ':issue' =>
+                    (int) $this->id,
 
-                ":type" =>
-                    $f3->get(
-                        "issue_type.project"
-                    ),
+                ':type' =>
+                    (int) \Base::instance()
+                        ->get(
+                            'issue_type.project'
+                        ),
             ]
         );
 
         return $this;
     }
 
+    /**
+     * Get active children.
+     */
     public function getChildren(): array
     {
         if ($this->_children !== null) {
             return $this->_children;
         }
 
+        if (!$this->id) {
+            return $this->_children = [];
+        }
+
         return $this->_children =
             $this->find([
-                "parent_id = ? "
-                . "AND deleted_date IS NULL",
-                $this->id,
+                'parent_id = ? AND deleted_date IS NULL',
+                (int) $this->id,
             ]);
     }
 
+    /**
+     * Generate hashes used by the existing change-detection protocol.
+     *
+     * MD5 is kept for compatibility with the existing controller/client
+     * implementation. Changing it requires both sides to be migrated.
+     */
     public function hashState(): array
     {
         $result = $this->cast();
 
-        foreach ($result as &$value) {
+        foreach (
+            $result as &$value
+        ) {
             $value = md5(
-                (string) ($value ?? "")
+                (string) (
+                    $value ?? ''
+                )
             );
         }
 
@@ -765,6 +1143,9 @@ class Issue extends \Model
         return $result;
     }
 
+    /**
+     * Close issue.
+     */
     public function close(): Issue
     {
         if (
@@ -774,10 +1155,11 @@ class Issue extends \Model
             return $this;
         }
 
-        $status = new Issue\Status();
+        $status =
+            new Issue\Status();
 
         $status->load([
-            "closed = ?",
+            'closed = ?',
             1,
         ]);
 
@@ -785,39 +1167,51 @@ class Issue extends \Model
             return $this;
         }
 
-        $this->status = $status->id;
+        $this->status =
+            (int) $status->id;
 
         $this->closed_date =
-            date("Y-m-d H:i:s");
+            date('Y-m-d H:i:s');
 
         $this->save();
 
         return $this;
     }
 
+    /**
+     * Return this issue and all descendant IDs.
+     *
+     * Iterative implementation avoids uncontrolled recursion and
+     * prevents circular hierarchy processing.
+     */
     public function descendantIds(): array
     {
+        if (!$this->id) {
+            return [];
+        }
+
         $ids = [];
-        $seen = [];
+        $visited = [];
 
         $stack = [
             [$this, 0],
         ];
 
-        while ($stack) {
+        while ($stack !== []) {
             [$issue, $depth] =
                 array_pop($stack);
 
-            $id = (int) $issue->id;
+            $id =
+                (int) $issue->id;
 
             if (
                 $id <= 0
-                || isset($seen[$id])
+                || isset($visited[$id])
             ) {
                 continue;
             }
 
-            $seen[$id] = true;
+            $visited[$id] = true;
             $ids[] = $id;
 
             if (
@@ -831,6 +1225,12 @@ class Issue extends \Model
                 $issue->getChildren()
                 as $child
             ) {
+                if (
+                    !$child instanceof self
+                ) {
+                    continue;
+                }
+
                 $stack[] = [
                     $child,
                     $depth + 1,
@@ -841,53 +1241,66 @@ class Issue extends \Model
         return $ids;
     }
 
+    /**
+     * Calculate project statistics.
+     */
     public function projectStats(): array
     {
         $stats = [
-            "total" => 0,
-            "complete" => 0,
-            "hours_spent" => 0,
-            "hours_total" => 0,
+            'total' => 0,
+            'complete' => 0,
+            'hours_spent' => 0.0,
+            'hours_total' => 0.0,
         ];
 
-        $seen = [];
+        if (!$this->id) {
+            return $stats;
+        }
+
+        $visited = [];
 
         $stack = [
             [$this, 0],
         ];
 
-        while ($stack) {
+        while ($stack !== []) {
             [$issue, $depth] =
                 array_pop($stack);
 
-            $id = (int) $issue->id;
+            $id =
+                (int) $issue->id;
 
             if (
                 $id <= 0
-                || isset($seen[$id])
+                || isset($visited[$id])
             ) {
                 continue;
             }
 
-            $seen[$id] = true;
+            $visited[$id] = true;
 
-            $stats["total"]++;
+            $stats['total']++;
 
-            $stats["complete"] +=
-                $issue->closed_date
-                    ? 1
-                    : 0;
+            if ($issue->closed_date) {
+                $stats['complete']++;
+            }
 
-            $stats["hours_spent"] +=
+            $stats['hours_spent'] +=
                 max(
                     0,
-                    (float) $issue->hours_spent
+                    (float) (
+                        $issue->hours_spent
+                        ?? 0
+                    )
                 );
 
-            $stats["hours_total"] +=
+            $stats['hours_total'] +=
                 max(
                     0,
-                    (float) $issue->hours_total
+                    (float) (
+                        $issue->hours_total
+                        ?? 0
+                    )
                 );
 
             if (
@@ -901,16 +1314,23 @@ class Issue extends \Model
                 $issue->getChildren()
                 as $child
             ) {
-                $stack[] = [
-                    $child,
-                    $depth + 1,
-                ];
+                if (
+                    $child instanceof self
+                ) {
+                    $stack[] = [
+                        $child,
+                        $depth + 1,
+                    ];
+                }
             }
         }
 
         return $stats;
     }
 
+    /**
+     * Verify if user is allowed to access this issue.
+     */
     public function allowAccess(
         ?\Model\User $user = null
     ): bool {
@@ -920,18 +1340,20 @@ class Issue extends \Model
             !$user instanceof
                 \Model\User
         ) {
-            $user =
-                $f3->get("user_obj");
+            $candidate =
+                $f3->get('user_obj');
+
+            if (
+                !$candidate instanceof
+                    \Model\User
+            ) {
+                return false;
+            }
+
+            $user = $candidate;
         }
 
-        if (
-            !$user instanceof
-                \Model\User
-        ) {
-            return false;
-        }
-
-        if ($user->role === "admin") {
+        if ($user->role === 'admin') {
             return true;
         }
 
@@ -941,8 +1363,20 @@ class Issue extends \Model
 
         if (
             !$f3->get(
-                "security.restrict_access"
+                'security.restrict_access'
             )
+        ) {
+            return true;
+        }
+
+        $userId =
+            (int) $user->id;
+
+        if (
+            (int) $this->owner_id
+                === $userId
+            || (int) $this->author_id
+                === $userId
         ) {
             return true;
         }
@@ -951,21 +1385,230 @@ class Issue extends \Model
             \Helper\Dashboard::instance()
                 ->getGroupIds();
 
+        if (!is_array($groupIds)) {
+            return false;
+        }
+
+        $groupIds =
+            array_map(
+                'intval',
+                $groupIds
+            );
+
         return
-            (int) $this->owner_id
-                === (int) $user->id
-            || (int) $this->author_id
-                === (int) $user->id
-            || in_array(
+            $this->owner_id !== null
+            && in_array(
                 (int) $this->owner_id,
-                array_map(
-                    "intval",
-                    is_array($groupIds)
-                        ? $groupIds
-                        : []
-                ),
+                $groupIds,
                 true
             );
+    }
+
+    /**
+     * Convert a value to a positive integer.
+     */
+    private static function positiveInt(
+        mixed $value
+    ): ?int {
+        if (
+            $value === null
+            || $value === ''
+            || is_bool($value)
+        ) {
+            return null;
+        }
+
+        $filtered =
+            filter_var(
+                $value,
+                FILTER_VALIDATE_INT,
+                [
+                    'options' => [
+                        'min_range' => 1,
+                    ],
+                ]
+            );
+
+        return $filtered === false
+            ? null
+            : $filtered;
+    }
+
+    /**
+     * Convert optional ID to positive integer/null.
+     */
+    private static function nullablePositiveInt(
+        mixed $value
+    ): ?int {
+        if (
+            $value === null
+            || $value === ''
+            || $value === 0
+            || $value === '0'
+        ) {
+            return null;
+        }
+
+        return self::positiveInt(
+            $value
+        );
+    }
+
+    /**
+     * Validate a non-negative numeric value.
+     */
+    private static function nullableNonNegativeFloat(
+        mixed $value
+    ): ?float {
+        if (
+            $value === null
+            || $value === ''
+        ) {
+            return null;
+        }
+
+        if (!is_numeric($value)) {
+            return null;
+        }
+
+        $value = (float) $value;
+
+        if (
+            !is_finite($value)
+            || $value < 0
+        ) {
+            return null;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Validate and normalize a date.
+     */
+    private static function normalizeDate(
+        mixed $value
+    ): ?string {
+        if (
+            $value === null
+            || $value === ''
+        ) {
+            return null;
+        }
+
+        $value =
+            trim(
+                (string) $value
+            );
+
+        if ($value === '') {
+            return null;
+        }
+
+        $date =
+            \DateTimeImmutable::createFromFormat(
+                '!Y-m-d',
+                $value
+            );
+
+        $errors =
+            \DateTimeImmutable::getLastErrors();
+
+        if (
+            $date !== false
+            && (
+                $errors === false
+                || (
+                    $errors['warning_count'] === 0
+                    && $errors['error_count'] === 0
+                )
+            )
+            && $date->format('Y-m-d')
+                === $value
+        ) {
+            return $value;
+        }
+
+        $timestamp =
+            strtotime($value);
+
+        if ($timestamp === false) {
+            return null;
+        }
+
+        return date(
+            'Y-m-d',
+            $timestamp
+        );
+    }
+
+    /**
+     * Validate repeat-cycle value.
+     */
+    private static function normalizeRepeatCycle(
+        mixed $value
+    ): ?string {
+        if (
+            !is_string($value)
+            || $value === ''
+        ) {
+            return null;
+        }
+
+        $value = trim($value);
+
+        return in_array(
+            $value,
+            self::REPEAT_CYCLES,
+            true
+        )
+            ? $value
+            : null;
+    }
+
+    /**
+     * Shift date safely.
+     */
+    private static function shiftDate(
+        mixed $date,
+        string $modifier
+    ): ?string {
+        if (
+            !is_string($date)
+            || trim($date) === ''
+        ) {
+            return null;
+        }
+
+        $timestamp =
+            strtotime(
+                $date . ' ' . $modifier
+            );
+
+        if ($timestamp === false) {
+            return null;
+        }
+
+        return date(
+            'Y-m-d',
+            $timestamp
+        );
+    }
+
+    /**
+     * Mask sequences resembling credit-card numbers.
+     */
+    private static function maskSensitiveNumbers(
+        string $description
+    ): string {
+        $result = preg_replace(
+            '/(?:\d{3,4}-){3}(\d{3,4})/',
+            '************$1',
+            $description
+        );
+
+        return $result
+            ?? $description;
     }
 }
 
